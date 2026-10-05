@@ -2,12 +2,12 @@ import argparse
 
 from guava import logging_utils
 
-from . import fnol_flow  # noqa: F401
+from . import fnol_flow, status_flow  # noqa: F401
 from .agent import agent
 
 # Flow modules register themselves with the shared agent as a side effect
-# of being imported (see agent.register_flow). status_flow / tow_flow are
-# added here as they're built.
+# of being imported (see agent.register_flow). tow_flow is added here as
+# it's built.
 
 if __name__ == "__main__":
     logging_utils.configure_logging()
