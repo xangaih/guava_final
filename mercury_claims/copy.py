@@ -119,3 +119,19 @@ INTAKE_QUESTION_ACKNOWLEDGMENT = (
     "I'm just gathering the details needed to get your claim started. If there's something "
     "specific I can clarify about that, let me know -- otherwise, let's continue."
 )
+
+# status_flow: F11's safe default for anything that looks like it's
+# about the claim just checked -- never reveals amounts or reasons.
+STATUS_CLAIM_DETAIL_DEFLECTION = (
+    "I'm not able to share additional details beyond your claim's current status -- your "
+    "assigned representative can go over the specifics with you."
+)
+
+# status_flow: a question that's clearly about something else entirely
+# (towing, enrollment) -- confirmed live, 2026-10-05, a towing question
+# got the claim-detail deflection above, which was a non-sequitur.
+STATUS_UNRELATED_QUESTION_ACKNOWLEDGMENT = (
+    "That's outside what I can help with on this call. If you'd like to ask about towing or "
+    "roadside assistance, or start a new claim, you're welcome to call back and choose that "
+    "option. For now, is there anything else about this claim I can help with?"
+)

@@ -1,6 +1,6 @@
 --- originals/claims_status/__main__.py	2026-10-05 09:47:18
-+++ mercury_claims/status_flow.py	2026-10-05 12:53:59
-@@ -1,358 +1,210 @@
++++ mercury_claims/status_flow.py	2026-10-05 13:12:14
+@@ -1,358 +1,244 @@
 -# SDK conformance: guava-sdk 0.44.0 (2026-09-15)
 -import argparse
 -import json
@@ -93,8 +93,28 @@
 -    if claim and claim["dob"] == dob:
 -        return claim
 -    return None
--
--
++_intent = IntentRecognizer(
++    {
++        "transfer_to_human": (
++            "The caller explicitly asks to speak to a human, a representative, or a supervisor, "
++            "or wants to enroll in a new policy, become a new customer, or get an insurance quote "
++            "-- this line only handles existing policies and claims. This does NOT include the "
++            "caller asking about their own claim details or the status lookup process -- those "
++            "are normal parts of checking a claim, not a request for a human. (Confirmed live: "
++            "fnol_flow's broader version of this intent over-triggered on a benign claim question; "
++            "keeping this one narrow defensively.)"
++        )
++    }
++)
+ 
++_STATUS_INSTRUCTIONS = {
++    "received": copy.status_received,
++    "under_review": copy.status_under_review,
++    "awaiting_documents": copy.status_awaiting_documents,
++    "approved": copy.status_approved,
++    "closed": copy.status_closed,
++}
+ 
 -# ---------------------------------------------------------------------------
 -# Agent
 -# ---------------------------------------------------------------------------
@@ -107,30 +127,33 @@
 -        "answer questions about next steps, and connect them with an adjuster "
 -        "when needed"
 -    ),
-+_intent = IntentRecognizer(
-+    {
-+        "transfer_to_human": (
-+            "The caller explicitly asks to speak to a human, a representative, or a supervisor. "
-+            "This does NOT include the caller asking about their own claim details or the status "
-+            "lookup process -- those are normal parts of checking a claim, not a request for a "
-+            "human. (Confirmed live: fnol_flow's broader version of this intent over-triggered on "
-+            "a benign claim question; keeping this one narrow defensively.)"
-+        )
-+    }
++# A question during a status check defaults to "assume it's about this
++# claim" (the F11-safe deflection, which never leaks anything either
++# way) -- the opposite default from fnol_flow's guard, since most
++# questions asked here naturally are about the claim just looked up.
++# Only a question that's clearly about something else entirely (towing,
++# enrollment) gets a different, honest response instead of the
++# claim-status non-sequitur.
++_UNRELATED_TOPIC_KEYWORDS = (
++    "tow",
++    "roadside",
++    "road side",
++    "enroll",
++    "sign up",
++    "new policy",
++    "new customer",
++    "get a quote",
++    "get insurance",
  )
  
 -_mid_call_intent = IntentRecognizer({
 -    "do_not_contact": "The caller wants to stop receiving calls or be removed from the contact list",
 -    "speak_to_adjuster": "The caller wants to speak to a claims adjuster or live person about their claim",
 -})
-+_STATUS_INSTRUCTIONS = {
-+    "received": copy.status_received,
-+    "under_review": copy.status_under_review,
-+    "awaiting_documents": copy.status_awaiting_documents,
-+    "approved": copy.status_approved,
-+    "closed": copy.status_closed,
-+}
  
++def _is_unrelated_to_this_claim(question: str) -> bool:
++    q = question.lower()
++    return any(kw in q for kw in _UNRELATED_TOPIC_KEYWORDS)
  
 -@agent.on_call_start
 -def on_call_start(call: guava.Call) -> None:
@@ -141,6 +164,7 @@
 -            f"{call.get_variable('contact_name')} regarding an open claim. "
 -            f"Please call us back at 1-800-555-0100 at your convenience. Thank you."
 -        ),
++
 +def _check_claim_number_digits(value: object) -> tuple[bool, str]:
 +    text = str(value)
 +    if text.isdigit() and len(text) == 7:
@@ -185,6 +209,10 @@
 -                guava.Say(
 -                    f"I have an update on your claim. Before I share any details, "
 -                    f"I need to verify your identity with a quick question."
++            guava.Say(
++                "Could you give me your claim number? You can say the digits after CLM-dash, or "
++                "enter them on your phone's keypad -- whichever's easier."
++            ),
 +            guava.Field(
 +                key="status_claim_number_digits",
 +                description=(
@@ -259,13 +287,6 @@
  
 -    call.set_variable("claim_status", claim["status"])
 -    call.set_variable("adjuster_number", claim["adjuster_number"])
--
--    call.add_info("claim_details", {
--        "claim_number": claim_number,
--        "status": claim["status"],
--        "status_detail": claim["status_detail"],
--        "adjuster": claim["adjuster"],
--    })
 +    claim_number = f"CLM-{call.get_field('status_claim_number_digits')}"
 +    try:
 +        dob = as_date(call.get_field("status_dob"))
@@ -278,6 +299,15 @@
 +        return
 +    zip_code = call.get_field("status_zip")
 +    result = client.lookup_claim(claim_number, dob, zip_code)
+ 
+-    call.add_info("claim_details", {
+-        "claim_number": claim_number,
+-        "status": claim["status"],
+-        "status_detail": claim["status_detail"],
+-        "adjuster": claim["adjuster"],
+-    })
++    attempts = call.get_variable("status_identity_attempts", 0) + 1
++    call.set_variable("status_identity_attempts", attempts)
  
 -    if claim["status"] == "denied":
 -        call.set_task(
@@ -356,9 +386,6 @@
 -                ),
 -            ],
 -        )
-+    attempts = call.get_variable("status_identity_attempts", 0) + 1
-+    call.set_variable("status_identity_attempts", attempts)
- 
 +    match result:
 +        case Ok(value):
 +            call.set_variable("status_claim_number", claim_number)
@@ -387,9 +414,16 @@
 +            set_outcome(call, "error", transfer_reason="backend_unavailable")
 +            transfer_to_human(call, instructions=copy.TRANSFER_BACKEND_DOWN)
  
+ 
 -@agent.on_task_complete("deliver_status")
 -def on_status_delivered(call: guava.Call) -> None:
 -    claim_status = call.get_variable("claim_status")
++def _deliver_status(call: guava.Call, status: str, adjuster_name: str | None, adjuster_phone: str | None) -> None:
++    if status in ("denied", "needs_human"):
++        # H8: warm transfer, never speak the reason.
++        set_outcome(call, "transferred", transfer_reason=f"status_{status}")
++        transfer_to_human(call, instructions=copy.STATUS_TRANSFER_NO_REASON)
++        return
  
 -    if claim_status == "denied" and call.get_field("wants_to_appeal") == "yes":
 -        adjuster_number = call.get_variable("adjuster_number")
@@ -408,13 +442,6 @@
 -                f"if they have any additional questions, and wish them well, and politely say goodbye."
 -            )
 -        )
-+def _deliver_status(call: guava.Call, status: str, adjuster_name: str | None, adjuster_phone: str | None) -> None:
-+    if status in ("denied", "needs_human"):
-+        # H8: warm transfer, never speak the reason.
-+        set_outcome(call, "transferred", transfer_reason=f"status_{status}")
-+        transfer_to_human(call, instructions=copy.STATUS_TRANSFER_NO_REASON)
-+        return
- 
 +    builder = _STATUS_INSTRUCTIONS.get(status)
 +    if builder is None:
 +        # An unknown or missing status counts as unavailable.
@@ -422,12 +449,25 @@
 +        transfer_to_human(call, instructions=copy.TRANSFER_BACKEND_DOWN)
 +        return
  
--@agent.on_action_request
--def on_action_request(call: guava.Call, intent_summary: str):
--    return _mid_call_intent.classify(intent_summary)
 +    set_outcome(call, "status_delivered")
 +    call.hangup(final_instructions=builder(adjuster_name, adjuster_phone))
  
+-@agent.on_action_request
+-def on_action_request(call: guava.Call, intent_summary: str):
+-    return _mid_call_intent.classify(intent_summary)
+ 
++def handle_question(call: guava.Call, question: str) -> str:
++    if _is_unrelated_to_this_claim(question):
++        # Confirmed live (2026-10-05): a totally unrelated question
++        # ("can you give me information on the towing requests?") got
++        # the claim-detail deflection below, which read as a
++        # non-sequitur -- same bug class as fnol_flow's old blunt
++        # handle_question, just not fixed here yet at the time.
++        return copy.STATUS_UNRELATED_QUESTION_ACKNOWLEDGMENT
++    # F11: never speak settlement amounts or denial reasons; the backend
++    # doesn't even expose them, so there's nothing to leak, but the
++    # phrasing here keeps the caller from feeling stonewalled.
++    return copy.STATUS_CLAIM_DETAIL_DEFLECTION
  
 -@agent.on_action("do_not_contact")
 -def handle_dnc(call: guava.Call) -> None:
@@ -438,15 +478,10 @@
 -            "again by phone and that future claim updates will be sent by mail, "
 -            "and politely say goodbye."
 -        )
-+def handle_question(call: guava.Call, question: str) -> str:
-+    # F11: never speak settlement amounts or denial reasons; the backend
-+    # doesn't even expose them, so there's nothing to leak, but the
-+    # phrasing here keeps the caller from feeling stonewalled.
-+    return (
-+        "I'm not able to share additional details beyond your claim's current status -- your "
-+        "assigned representative can go over the specifics with you."
-     )
+-    )
  
++def classify_intent(intent_summary: str):
++    return _intent.classify(intent_summary)
  
 -@agent.on_action("speak_to_adjuster")
 -def handle_transfer_request(call: guava.Call) -> None:
@@ -464,10 +499,8 @@
 -                "and politely say goodbye."
 -            )
 -        )
-+def classify_intent(intent_summary: str):
-+    return _intent.classify(intent_summary)
  
- 
+-
 -@agent.on_outbound_failed
 -def on_outbound_failed(event: OutboundCallFailed) -> None:
 -    logging.error("Outbound call failed: %s (code %d)", event.error_reason, event.error_code)

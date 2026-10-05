@@ -161,3 +161,20 @@ def test_identity_fails_cleanly_instead_of_crashing_on_unparseable_dob():
     transfers = _transfers(call)
     assert len(transfers) == 1
     assert call.get_variable("call_outcome") == "error"
+
+
+def test_handle_question_about_the_claim_gets_the_f11_safe_deflection():
+    call = _call()
+    for question in ["Why was my claim denied?", "How much is my settlement?", "What's happening with my claim?"]:
+        assert status_flow.handle_question(call, question) == status_flow.copy.STATUS_CLAIM_DETAIL_DEFLECTION
+
+
+def test_handle_question_unrelated_to_claim_gets_a_different_honest_response():
+    # Regression test for a live bug (2026-10-05): "Can you give me
+    # information on the towing requests?" got the claim-detail
+    # deflection, which was a non-sequitur.
+    call = _call()
+    for question in ["Can you give me information on the towing requests?", "I'd like to enroll in a new policy."]:
+        answer = status_flow.handle_question(call, question)
+        assert answer == status_flow.copy.STATUS_UNRELATED_QUESTION_ACKNOWLEDGMENT
+        assert answer != status_flow.copy.STATUS_CLAIM_DETAIL_DEFLECTION

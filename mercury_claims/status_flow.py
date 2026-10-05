@@ -33,11 +33,13 @@ from .models import Malformed, NotFound, Ok, Unavailable
 _intent = IntentRecognizer(
     {
         "transfer_to_human": (
-            "The caller explicitly asks to speak to a human, a representative, or a supervisor. "
-            "This does NOT include the caller asking about their own claim details or the status "
-            "lookup process -- those are normal parts of checking a claim, not a request for a "
-            "human. (Confirmed live: fnol_flow's broader version of this intent over-triggered on "
-            "a benign claim question; keeping this one narrow defensively.)"
+            "The caller explicitly asks to speak to a human, a representative, or a supervisor, "
+            "or wants to enroll in a new policy, become a new customer, or get an insurance quote "
+            "-- this line only handles existing policies and claims. This does NOT include the "
+            "caller asking about their own claim details or the status lookup process -- those "
+            "are normal parts of checking a claim, not a request for a human. (Confirmed live: "
+            "fnol_flow's broader version of this intent over-triggered on a benign claim question; "
+            "keeping this one narrow defensively.)"
         )
     }
 )
@@ -49,6 +51,30 @@ _STATUS_INSTRUCTIONS = {
     "approved": copy.status_approved,
     "closed": copy.status_closed,
 }
+
+# A question during a status check defaults to "assume it's about this
+# claim" (the F11-safe deflection, which never leaks anything either
+# way) -- the opposite default from fnol_flow's guard, since most
+# questions asked here naturally are about the claim just looked up.
+# Only a question that's clearly about something else entirely (towing,
+# enrollment) gets a different, honest response instead of the
+# claim-status non-sequitur.
+_UNRELATED_TOPIC_KEYWORDS = (
+    "tow",
+    "roadside",
+    "road side",
+    "enroll",
+    "sign up",
+    "new policy",
+    "new customer",
+    "get a quote",
+    "get insurance",
+)
+
+
+def _is_unrelated_to_this_claim(question: str) -> bool:
+    q = question.lower()
+    return any(kw in q for kw in _UNRELATED_TOPIC_KEYWORDS)
 
 
 def _check_claim_number_digits(value: object) -> tuple[bool, str]:
@@ -80,6 +106,10 @@ def start(call: guava.Call) -> None:
         checklist=[
             guava.Say(
                 "I can help you check on an existing claim. First, I need to verify your identity."
+            ),
+            guava.Say(
+                "Could you give me your claim number? You can say the digits after CLM-dash, or "
+                "enter them on your phone's keypad -- whichever's easier."
             ),
             guava.Field(
                 key="status_claim_number_digits",
@@ -179,13 +209,17 @@ def _deliver_status(call: guava.Call, status: str, adjuster_name: str | None, ad
 
 
 def handle_question(call: guava.Call, question: str) -> str:
+    if _is_unrelated_to_this_claim(question):
+        # Confirmed live (2026-10-05): a totally unrelated question
+        # ("can you give me information on the towing requests?") got
+        # the claim-detail deflection below, which read as a
+        # non-sequitur -- same bug class as fnol_flow's old blunt
+        # handle_question, just not fixed here yet at the time.
+        return copy.STATUS_UNRELATED_QUESTION_ACKNOWLEDGMENT
     # F11: never speak settlement amounts or denial reasons; the backend
     # doesn't even expose them, so there's nothing to leak, but the
     # phrasing here keeps the caller from feeling stonewalled.
-    return (
-        "I'm not able to share additional details beyond your claim's current status -- your "
-        "assigned representative can go over the specifics with you."
-    )
+    return copy.STATUS_CLAIM_DETAIL_DEFLECTION
 
 
 def classify_intent(intent_summary: str):

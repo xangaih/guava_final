@@ -43,9 +43,11 @@ _intent = IntentRecognizer(
             "The caller explicitly asks to speak to a human, a representative, or a supervisor; "
             "disputes who was at fault; mentions a lawyer, attorney, lawsuit, or formal complaint; "
             "or states that they are not the policyholder and are calling on someone else's behalf. "
-            "This does NOT include the caller asking what information is still needed, asking "
-            "about their own claim or vehicle details, or asking general questions about the "
-            "process -- those are normal parts of filing a claim, not a request for a human."
+            "Also covers the caller wanting to enroll in a new policy, become a new customer, or "
+            "get an insurance quote -- this line only handles existing policies and claims. This "
+            "does NOT include the caller asking what information is still needed, asking about "
+            "their own claim or vehicle details, or asking general questions about the process -- "
+            "those are normal parts of filing a claim, not a request for a human."
         ),
     }
 )
@@ -125,6 +127,10 @@ def start(call: guava.Call) -> None:
             guava.Say(
                 "I'm sorry to hear you may be dealing with a loss. I'll help you get a claim "
                 "started. First, I need to verify your identity."
+            ),
+            guava.Say(
+                "Could you give me your policy number? You can say the digits after MCY-dash, "
+                "or enter them on your phone's keypad -- whichever's easier."
             ),
             guava.Field(
                 key="fnol_policy_number_digits",
