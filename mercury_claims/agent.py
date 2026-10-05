@@ -17,6 +17,7 @@ which are intentionally common to every flow (H3/H4 both just mean
 
 import logging
 from dataclasses import dataclass
+from datetime import date, datetime
 from typing import Callable, Optional
 
 import guava
@@ -72,8 +73,72 @@ def _current_flow(call: guava.Call) -> Optional[FlowHandlers]:
     return _flows.get(call.get_variable("flow"))
 
 
-def _transfer_to_human(call: guava.Call, instructions: str = copy.TRANSFER_GENERIC) -> None:
+def transfer_to_human(call: guava.Call, instructions: str = copy.TRANSFER_GENERIC) -> None:
     call.transfer(destination=config.HUMAN_LINE_NUMBER, instructions=instructions)
+
+
+# --- Shared handoff infrastructure (section 8.5: handoff rules in code) ---
+#
+# H7 (a validator fails 3 times on one field -> transfer) applies to every
+# flow's fields, so it's implemented once here rather than per flow.
+# on_validate's automatic retry (the SDK calls call.retry_task() itself
+# whenever a validator returns non-True) has no built-in attempt limit --
+# left alone, a caller who keeps giving an invalid value loops forever,
+# which is exactly the "no loops" failure the brief calls out. Wrapping a
+# validator with bounded_validate() caps that at MAX_VALIDATION_ATTEMPTS:
+# past the limit it gives up (returns True so the task completes) and
+# flags the call via a shared variable; every flow's on_task_complete
+# handler checks needs_handoff(call) first and transfers if it's set,
+# before doing anything else.
+
+MAX_VALIDATION_ATTEMPTS = 3
+
+
+def bounded_validate(field_key: str, check: Callable[[object], tuple[bool, str]]):
+    attempts_key = f"_{field_key}_validation_attempts"
+
+    def validator(call: guava.Call, value) -> bool | tuple[bool, str]:
+        ok, message = check(value)
+        if ok:
+            return True
+        attempts = call.get_variable(attempts_key, 0) + 1
+        call.set_variable(attempts_key, attempts)
+        if attempts >= MAX_VALIDATION_ATTEMPTS:
+            call.set_variable("handoff_reason", "validation_exhausted")
+            return True
+        return (False, message)
+
+    return validator
+
+
+def needs_handoff(call: guava.Call) -> bool:
+    return call.get_variable("handoff_reason") is not None
+
+
+# --- Typed-field coercion ---
+#
+# The SDK's ActionItemCompletedEvent carries `payload: Any` with no local
+# type coercion (verified against the installed source); the runtime type
+# of a "date"/"datetime" field's value is whatever the server sends, which
+# isn't visible from this package. These accept either an already-parsed
+# object or an ISO-8601 string, so flow code doesn't have to assume.
+
+def as_date(value: object) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value))
+
+
+def as_datetime(value: object) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    text = str(value)
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return datetime.combine(date.fromisoformat(text), datetime.min.time())
 
 
 @agent.on_call_received
@@ -112,7 +177,7 @@ def on_route_complete(call: guava.Call) -> None:
 
     if flow_name is None:
         # "something_else", or anything unrecognized.
-        _transfer_to_human(call)
+        transfer_to_human(call)
         return
 
     handlers = _flows.get(flow_name)
@@ -120,7 +185,7 @@ def on_route_complete(call: guava.Call) -> None:
         # Listed as a call type in scope (section 1) but not built yet
         # in this codebase.
         logger.warning("no flow registered for %r yet", flow_name)
-        _transfer_to_human(call)
+        transfer_to_human(call)
         return
 
     call.set_variable("flow", flow_name)
@@ -148,7 +213,7 @@ def on_transfer_to_human(call: guava.Call) -> None:
     # H3 (asks for a person/supervisor) and H4 (disputes fault, mentions
     # attorney/lawsuit/complaint) both just mean "transfer" -- one shared
     # action key avoids every flow registering its own near-duplicate.
-    _transfer_to_human(call)
+    transfer_to_human(call)
 
 
 @agent.on_session_end

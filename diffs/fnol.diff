@@ -1,0 +1,882 @@
+--- originals/fnol/__main__.py	2026-10-05 09:47:18
++++ mercury_claims/fnol_flow.py	2026-10-05 10:52:16
+@@ -1,474 +1,487 @@
+-# SDK conformance: guava-sdk 0.44.0 (2026-09-15)
+-import argparse
+-import json
+-import logging
+-from datetime import datetime, time, timezone
++"""Report a new auto claim. Descends from originals/fnol/__main__.py.
+ 
++Same task shape as the original (identity -> loss basics -> vehicle ->
++police report -> other party -> submit, with a tow offer when the car
++isn't drivable), but:
++  - every collected field reaches the claim record (C2, fixes F1)
++  - no promise is spoken unless the server confirmed it (C4, fixes F2)
++  - DOB is a typed date field, 2 attempts then transfer, no enumeration
++    leak (C5, fixes F4/F5)
++  - a lapsed/cancelled policy does not end the call -- intake continues
++    and the backend flags it for review on its own (C6, fixes F6)
++  - handoff rules H1 (disclosure, already in agent.py's opening script),
++    H2, H5, H6, H7 are in code, not left to the model (C10)
++"""
++
++import uuid
++from datetime import datetime
++
+ import guava
+-from guava import logging_utils
+ from guava.helpers.llm import IntentRecognizer
+-from guava.events import BotSessionEnded, OutboundCallFailed
+ 
+-BUSINESS_HOURS_START = time(8, 0)
+-BUSINESS_HOURS_END = time(18, 0)
++from . import copy
++from .agent import (
++    FlowHandlers,
++    as_date,
++    as_datetime,
++    bounded_validate,
++    needs_handoff,
++    register_flow,
++    transfer_to_human,
++)
++from .agent import agent as _agent
++from .client import client
++from .models import Malformed, NotFound, Ok, Unavailable
+ 
+-ADJUSTER_LINE = "+15551000300"
+-
+-
+-# ---------------------------------------------------------------------------
+-# Mock API — simulates policy lookup and claim creation
+-# ---------------------------------------------------------------------------
+-
+-MOCK_POLICIES = {
+-    "KPC-449821": {
+-        "policyholder": "Maria Santos",
+-        "dob": "1985-03-14",
+-        "coverage_types": ["auto", "property"],
+-        "status": "active",
+-    },
+-    "KPC-338710": {
+-        "policyholder": "David Park",
+-        "dob": "1992-07-22",
+-        "coverage_types": ["auto"],
+-        "status": "active",
+-    },
+-    "KPC-112504": {
+-        "policyholder": "Rachel Kim",
+-        "dob": "1978-11-05",
+-        "coverage_types": ["property", "liability"],
+-        "status": "lapsed",
+-    },
+-}
+-
+-
+-def lookup_policy(policy_number):
+-    return MOCK_POLICIES.get(policy_number)
+-
+-
+-def create_claim(policy_number, loss_type, details):
+-    claim_number = f"CLM-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M')}"
+-    logging.info("[MOCK API] POST /claims — created %s for policy %s", claim_number, policy_number)
+-    return claim_number
+-
+-
+-# ---------------------------------------------------------------------------
+-# Agent
+-# ---------------------------------------------------------------------------
+-
+-agent = guava.Agent(
+-    name="Avery",
+-    organization="Keystone Property & Casualty",
+-    purpose=(
+-        "assist policyholders with filing a First Notice of Loss and collecting "
+-        "the details needed to open a new insurance claim"
+-    ),
++_intent = IntentRecognizer(
++    {
++        "transfer_to_human": (
++            "The caller wants to speak to a human representative or supervisor, disputes fault, "
++            "mentions an attorney, lawsuit, or complaint, or says they are not the person named on "
++            "the policy (calling on behalf of someone else)"
++        ),
++    }
+ )
+ 
+-_mid_call_intent = IntentRecognizer({
+-    "speak_to_adjuster": "The caller wants to speak to a claims adjuster, live person, or supervisor",
+-    "withdraw": "The caller wants to stop the process, hang up, or call back later",
+-})
+ 
++def _get_or_create_idempotency_key(call: guava.Call) -> str:
++    key = call.get_variable("fnol_idempotency_key")
++    if not key:
++        key = str(uuid.uuid4())
++        call.set_variable("fnol_idempotency_key", key)
++    return key
+ 
+-def _is_business_hours():
+-    now = datetime.now().time()
+-    return BUSINESS_HOURS_START <= now < BUSINESS_HOURS_END
+ 
++def _check_policy_number(value: object) -> tuple[bool, str]:
++    if isinstance(value, str) and value.upper().startswith("MCY-") and len(value) >= 8:
++        return True, ""
++    return (
++        False,
++        "That doesn't look like a valid policy number. It should start with MCY followed by a "
++        "dash and six digits, like MCY-100245.",
++    )
+ 
+-@agent.on_call_received
+-def on_call_received(call_info: guava.CallInfo) -> guava.IncomingCallAction:
+-    if _is_business_hours():
+-        return guava.AcceptCall()
+-    return guava.DeclineCall()
+ 
++def _check_loss_at_not_future(value: object) -> tuple[bool, str]:
++    try:
++        when = as_datetime(value)
++    except ValueError:
++        return False, "I couldn't understand that date and time. Could you repeat it?"
++    if when > datetime.now():
++        return False, "That's in the future -- please confirm when the incident actually happened."
++    return True, ""
+ 
+-@agent.on_call_start
+-def on_call_start(call: guava.Call) -> None:
++
++def start(call: guava.Call) -> None:
+     call.set_task(
+-        "verify_policyholder",
++        "fnol_identity",
+         objective=(
+-            "Verify the caller's identity before collecting any claim information. "
+-            "Collect their policy number and date of birth. Do not discuss claim "
+-            "details, coverage, or policy status until identity is verified."
++            "Verify the caller's identity before collecting any claim information. Collect their "
++            "policy number and date of birth. Do not discuss claim details, coverage, or policy "
++            "status until identity is verified."
+         ),
+         checklist=[
+             guava.Say(
+-                "Thank you for calling Keystone Property & Casualty. I'm sorry to "
+-                "hear you may be dealing with a loss. I'll help you get a claim started. "
+-                "First, I need to verify your identity."
++                "I'm sorry to hear you may be dealing with a loss. I'll help you get a claim "
++                "started. First, I need to verify your identity."
+             ),
+             guava.Field(
+-                key="policy_number",
+-                description="The caller's policy number (format: KPC-NNNNNN)",
++                key="fnol_policy_number",
++                description="The caller's policy number (format: MCY-NNNNNN)",
+                 field_type="text",
+                 required=True,
+             ),
+             guava.Field(
+-                key="caller_dob",
+-                description="The caller's date of birth for identity verification",
+-                field_type="text",
++                key="fnol_dob",
++                description="The caller's date of birth, for identity verification",
++                field_type="date",
+                 required=True,
+             ),
+         ],
+     )
+ 
+ 
+-@agent.on_validate("policy_number")
+-def validate_policy_number(call: guava.Call, value) -> bool | tuple[bool, str]:
+-    if isinstance(value, str) and value.upper().startswith("KPC-") and len(value) >= 8:
+-        return True
+-    return (False, "That doesn't look like a valid policy number. It should start with KPC followed by a dash and six digits, like KPC-449821.")
++_agent.on_validate("fnol_policy_number")(bounded_validate("fnol_policy_number", _check_policy_number))
++_agent.on_validate("fnol_loss_at")(bounded_validate("fnol_loss_at", _check_loss_at_not_future))
+ 
+ 
+-@agent.on_task_complete("verify_policyholder")
+-def on_policyholder_verified(call: guava.Call) -> None:
+-    policy_number = call.get_field("policy_number")
+-    dob = call.get_field("caller_dob")
+-    policy = lookup_policy(policy_number)
++@_agent.on_task_complete("fnol_identity")
++def _on_identity_complete(call: guava.Call) -> None:
++    if needs_handoff(call):
++        transfer_to_human(call)
++        return
+ 
+-    if policy is None or policy["dob"] != dob:
+-        logging.warning("Identity verification failed for policy %s.", policy_number)
+-        call.hangup(
+-            final_instructions=(
+-                "Let the caller know that the information provided does not match "
+-                "our records. For security, you cannot proceed. Suggest they double-check "
+-                "their policy number and try calling again, or visit the Keystone "
+-                "website for help locating their policy information, and politely say goodbye."
++    policy_number = call.get_field("fnol_policy_number")
++    dob = as_date(call.get_field("fnol_dob"))
++    result = client.verify_policy(policy_number, dob)
++
++    attempts = call.get_variable("fnol_identity_attempts", 0) + 1
++    call.set_variable("fnol_identity_attempts", attempts)
++
++    match result:
++        case Ok(value) if value.verified:
++            call.set_variable("fnol_policy_number", policy_number)
++            call.set_variable("fnol_policyholder_name", value.holder_name)
++            call.set_task(
++                "fnol_loss_basics",
++                objective=(
++                    f"Identity verified -- the caller is {value.holder_name}. Find out what kind of "
++                    f"auto loss they're reporting, when and where it happened, and whether anyone was "
++                    f"hurt. Be empathetic and patient."
++                ),
++                checklist=[
++                    guava.Say(
++                        f"Thank you, {value.holder_name}. Your identity has been verified. Now let's "
++                        f"get your claim started. Can you tell me generally what happened?"
++                    ),
++                    guava.Field(
++                        key="fnol_loss_type",
++                        description="The category of auto loss being reported",
++                        field_type="multiple_choice",
++                        choices=["collision", "theft", "vandalism", "weather", "other"],
++                        required=True,
++                    ),
++                    guava.Field(
++                        key="fnol_loss_at",
++                        description="The date and time the incident occurred",
++                        field_type="datetime",
++                        required=True,
++                    ),
++                    guava.Field(
++                        key="fnol_loss_location",
++                        description="The address or location where the incident occurred",
++                        field_type="text",
++                        required=True,
++                    ),
++                    guava.Field(
++                        key="fnol_loss_description",
++                        description="A description of what happened",
++                        field_type="text",
++                        required=True,
++                    ),
++                    guava.Field(
++                        key="fnol_injuries",
++                        description="Whether any injuries to any person were involved in this incident",
++                        field_type="multiple_choice",
++                        choices=["yes", "no"],
++                        required=True,
++                    ),
++                ],
+             )
+-        )
+-        return
+-
+-    if policy["status"] == "lapsed":
+-        call.hangup(
+-            final_instructions=(
+-                "Let the caller know that their policy is no longer active. A claim "
+-                "cannot be filed against a lapsed policy. Suggest they contact their "
+-                "insurance agent to discuss reinstatement options, and politely say goodbye."
++        case Ok() | NotFound():
++            # Same failure shape either way: wrong policy number or wrong
++            # DOB look identical, so the caller can't learn which was
++            # wrong (F4/F5). Up to 2 attempts, then transfer (H5).
++            if attempts < 2:
++                call.retry_task(
++                    reason=(
++                        "The policy number or date of birth did not match our records. Ask the "
++                        "caller to carefully repeat both."
++                    )
++                )
++            else:
++                transfer_to_human(
++                    call,
++                    instructions=(
++                        "Let the caller know the information provided doesn't match our records and, "
++                        "for security, you can't continue without verifying identity. Connect them "
++                        "with a representative who can help look up their policy."
++                    ),
++                )
++        case Unavailable() | Malformed():
++            # H6: backend unavailable after the client's retry -- say so
++            # honestly, never pretend identity was checked.
++            transfer_to_human(
++                call,
++                instructions=(
++                    "Let the caller know our systems are temporarily unavailable and you can't "
++                    "verify their identity right now. Apologize, and connect them with a "
++                    "representative."
++                ),
+             )
+-        )
+-        return
+ 
+-    call.set_variable("policyholder_name", policy["policyholder"])
+-    call.set_variable("policy_number", policy_number)
+-    call.set_variable("coverage_types", policy["coverage_types"])
+ 
+-    call.add_info("verified_policy", {
+-        "policyholder": policy["policyholder"],
+-        "policy_number": policy_number,
+-        "coverage_types": policy["coverage_types"],
+-        "status": policy["status"],
+-    })
++@_agent.on_task_complete("fnol_loss_basics")
++def _on_loss_basics_complete(call: guava.Call) -> None:
++    if needs_handoff(call):
++        transfer_to_human(call)
++        return
+ 
++    if call.get_field("fnol_injuries") == "yes":
++        _submit_partial_claim_for_injury(call)
++        return
++
+     call.set_task(
+-        "classify_loss",
++        "fnol_vehicle",
+         objective=(
+-            f"Identity verified — the caller is {policy['policyholder']}. "
+-            f"Now determine the type of loss they are reporting. Ask them to describe "
+-            f"what happened in general terms so we can categorize the claim correctly."
++            "Collect details about the insured vehicle: year, make, model, color, plate, how many "
++            "passengers (if known), a description of the damage, where the vehicle is now, and "
++            "whether it's still drivable."
+         ),
+         checklist=[
+-            guava.Say(
+-                f"Thank you, {policy['policyholder']}. Your identity has been verified. "
+-                f"Now let's get your claim started. Can you tell me generally what happened?"
+-            ),
++            guava.Field(key="fnol_vehicle_year", description="The insured vehicle's model year", field_type="integer", required=True),
++            guava.Field(key="fnol_vehicle_make", description="The insured vehicle's make", field_type="text", required=True),
++            guava.Field(key="fnol_vehicle_model", description="The insured vehicle's model", field_type="text", required=True),
++            guava.Field(key="fnol_vehicle_color", description="The insured vehicle's color", field_type="text", required=True),
++            guava.Field(key="fnol_vehicle_plate", description="The insured vehicle's license plate", field_type="text", required=True),
++            guava.Field(key="fnol_passenger_count", description="Number of passengers in the insured vehicle, if known", field_type="integer", required=False),
++            guava.Field(key="fnol_damage_description", description="A description of the damage to the insured vehicle", field_type="text", required=True),
++            guava.Field(key="fnol_vehicle_location", description="Where the insured vehicle currently is", field_type="text", required=True),
+             guava.Field(
+-                key="loss_type",
+-                description="The category of loss being reported",
++                key="fnol_drivable",
++                description="Whether the insured vehicle is still drivable",
+                 field_type="multiple_choice",
+-                choices=["auto_collision", "auto_theft", "property_damage", "property_theft", "liability", "other"],
++                choices=["yes", "no"],
+                 required=True,
+             ),
++        ],
++    )
++
++
++def _submit_partial_claim_for_injury(call: guava.Call) -> None:
++    result = client.create_claim(
++        idempotency_key=_get_or_create_idempotency_key(call),
++        policy_number=call.get_variable("fnol_policy_number"),
++        loss_type=call.get_field("fnol_loss_type"),
++        loss_at=as_datetime(call.get_field("fnol_loss_at")),
++        loss_location=call.get_field("fnol_loss_location"),
++        description=call.get_field("fnol_loss_description"),
++        injuries=True,
++        intake_complete=False,
++    )
++    match result:
++        case Ok(value):
++            # H2: injuries reported -> save a partial record, then
++            # transfer. Only say "saved" because the write was confirmed.
++            transfer_to_human(
++                call,
++                instructions=(
++                    f"The caller has reported injuries. Let them know that because injuries are "
++                    f"involved, you need to connect them with a representative who can help right "
++                    f"away. Their information so far has been saved under claim number "
++                    f"{value.claim_number}. Do not discuss coverage or claim outcome."
++                ),
++            )
++        case _:
++            transfer_to_human(
++                call,
++                instructions=(
++                    "The caller has reported injuries. Let them know you're connecting them with a "
++                    "representative right away. Do NOT say their information has been saved -- the "
++                    "save could not be confirmed due to a system issue. Do not discuss coverage or "
++                    "claim outcome."
++                ),
++            )
++
++
++@_agent.on_task_complete("fnol_vehicle")
++def _on_vehicle_complete(call: guava.Call) -> None:
++    if needs_handoff(call):
++        transfer_to_human(call)
++        return
++    call.set_task(
++        "fnol_police_report",
++        objective="Find out whether a police report was filed for this incident.",
++        checklist=[
+             guava.Field(
+-                key="injuries_involved",
+-                description="Whether any injuries to any person were involved in this incident",
++                key="fnol_police_report_filed",
++                description="Whether a police report was filed for this incident",
+                 field_type="multiple_choice",
+-                choices=["yes", "no"],
++                choices=["yes", "no", "not sure"],
+                 required=True,
+             ),
++            guava.Field(key="fnol_police_report_number", description="The police report number, if known", field_type="text", required=False),
++            guava.Field(key="fnol_police_department", description="The police department that responded, if known", field_type="text", required=False),
+         ],
+     )
+ 
+ 
+-@agent.on_task_complete("classify_loss")
+-def on_loss_classified(call: guava.Call) -> None:
+-    loss_type = call.get_field("loss_type")
+-    injuries = call.get_field("injuries_involved")
+-    policyholder = call.get_variable("policyholder_name")
++@_agent.on_task_complete("fnol_police_report")
++def _on_police_report_complete(call: guava.Call) -> None:
++    if needs_handoff(call):
++        transfer_to_human(call)
++        return
++    call.set_task(
++        "fnol_other_party",
++        objective=(
++            "Ask if another party was involved and, if so, collect what the caller knows about "
++            "them. All of this is optional -- don't push if they don't know."
++        ),
++        checklist=[
++            guava.Field(key="fnol_other_party_name", description="The other party's name, if known", field_type="text", required=False),
++            guava.Field(key="fnol_other_party_plate", description="The other party's license plate, if known", field_type="text", required=False),
++            guava.Field(key="fnol_other_party_insurer", description="The other party's insurance company, if known", field_type="text", required=False),
++        ],
++    )
+ 
+-    call.set_variable("loss_type", loss_type)
+ 
+-    if injuries == "yes":
+-        call.transfer(
+-            destination=ADJUSTER_LINE,
+-            instructions=(
+-                f"The caller ({policyholder}) has reported injuries as part of this incident. "
+-                f"Let them know that because injuries are involved, you need to connect them "
+-                f"with a licensed adjuster who can guide them through the next steps. "
+-                f"Reassure them that their information so far has been saved."
+-            ),
+-        )
++@_agent.on_task_complete("fnol_other_party")
++def _on_other_party_complete(call: guava.Call) -> None:
++    if needs_handoff(call):
++        transfer_to_human(call)
+         return
++    _submit_claim(call)
+ 
+-    if loss_type in ("auto_collision", "auto_theft"):
+-        call.set_task(
+-            "collect_auto_details",
+-            objective=(
+-                f"Collect the details of the auto incident for {policyholder}. "
+-                f"Gather the date and location, a description of what happened, "
+-                f"the vehicles involved, and whether a police report was filed. "
+-                f"Be empathetic and patient."
+-            ),
+-            checklist=[
+-                guava.Field(
+-                    key="loss_date",
+-                    description="The date the incident occurred",
+-                    field_type="text",
+-                    required=True,
+-                ),
+-                guava.Field(
+-                    key="loss_location",
+-                    description="The address or location where the incident occurred",
+-                    field_type="text",
+-                    required=True,
+-                ),
+-                guava.Field(
+-                    key="loss_description",
+-                    description="A description of what happened",
+-                    field_type="text",
+-                    required=True,
+-                ),
+-                guava.Field(
+-                    key="vehicles_involved",
+-                    description="The number of vehicles involved and their descriptions if known",
+-                    field_type="text",
+-                    required=True,
+-                ),
+-                guava.Field(
+-                    key="police_report_filed",
+-                    description="Whether a police report was filed for this incident",
+-                    field_type="multiple_choice",
+-                    choices=["yes", "no", "not sure"],
+-                    required=True,
+-                ),
+-                guava.Field(
+-                    key="drivable",
+-                    description="Whether the insured vehicle is still drivable",
+-                    field_type="multiple_choice",
+-                    choices=["yes", "no"],
+-                    required=True,
+-                ),
+-            ],
+-        )
+-    elif loss_type in ("property_damage", "property_theft"):
+-        call.set_task(
+-            "collect_property_details",
+-            objective=(
+-                f"Collect the details of the property incident for {policyholder}. "
+-                f"Gather the date, property address, description of damage or theft, "
+-                f"and estimated value of the loss."
+-            ),
+-            checklist=[
+-                guava.Field(
+-                    key="loss_date",
+-                    description="The date the damage or theft occurred or was discovered",
+-                    field_type="text",
+-                    required=True,
+-                ),
+-                guava.Field(
+-                    key="property_address",
+-                    description="The full address of the affected property",
+-                    field_type="text",
+-                    required=True,
+-                ),
+-                guava.Field(
+-                    key="loss_description",
+-                    description="A description of the damage or what was stolen",
+-                    field_type="text",
+-                    required=True,
+-                ),
+-                guava.Field(
+-                    key="estimated_value",
+-                    description="The caller's rough estimate of the total damage or loss value",
+-                    field_type="text",
+-                    required=False,
+-                ),
+-                guava.Field(
+-                    key="police_report_filed",
+-                    description="Whether a police report was filed",
+-                    field_type="multiple_choice",
+-                    choices=["yes", "no", "not sure"],
+-                    required=True,
+-                ),
+-                guava.Field(
+-                    key="property_secured",
+-                    description="Whether the property is currently secured and safe to occupy",
+-                    field_type="multiple_choice",
+-                    choices=["yes", "no", "not sure"],
+-                    required=True,
+-                ),
+-            ],
+-        )
+-    else:
+-        call.set_task(
+-            "collect_general_details",
+-            objective=(
+-                f"Collect the details of the incident for {policyholder}. "
+-                f"Gather the date, location, a thorough description of what happened, "
+-                f"and any other parties involved."
+-            ),
+-            checklist=[
+-                guava.Field(
+-                    key="loss_date",
+-                    description="The date the incident occurred",
+-                    field_type="text",
+-                    required=True,
+-                ),
+-                guava.Field(
+-                    key="loss_location",
+-                    description="Where the incident occurred",
+-                    field_type="text",
+-                    required=True,
+-                ),
+-                guava.Field(
+-                    key="loss_description",
+-                    description="A thorough description of what happened",
+-                    field_type="text",
+-                    required=True,
+-                ),
+-                guava.Field(
+-                    key="other_parties",
+-                    description="Whether any other parties were involved and their details if known",
+-                    field_type="text",
+-                    required=False,
+-                ),
+-            ],
+-        )
+ 
+-
+-def _finalize_claim(call: guava.Call) -> None:
+-    policy_number = call.get_variable("policy_number")
+-    loss_type = call.get_variable("loss_type")
+-    policyholder = call.get_variable("policyholder_name")
+-
++def _submit_claim(call: guava.Call) -> None:
+     details = {
+-        "loss_date": call.get_field("loss_date"),
+-        "loss_description": call.get_field("loss_description"),
+-        "loss_type": loss_type,
++        "vehicle": {
++            "year": call.get_field("fnol_vehicle_year"),
++            "make": call.get_field("fnol_vehicle_make"),
++            "model": call.get_field("fnol_vehicle_model"),
++            "color": call.get_field("fnol_vehicle_color"),
++            "plate": call.get_field("fnol_vehicle_plate"),
++        },
++        "passenger_count": call.get_field("fnol_passenger_count"),
++        "damage_description": call.get_field("fnol_damage_description"),
++        "vehicle_location": call.get_field("fnol_vehicle_location"),
++        "other_party": {
++            "name": call.get_field("fnol_other_party_name"),
++            "plate": call.get_field("fnol_other_party_plate"),
++            "insurer": call.get_field("fnol_other_party_insurer"),
++        },
+     }
+-    claim_number = create_claim(policy_number, loss_type, details)
+-    call.set_variable("claim_number", claim_number)
++    drivable = call.get_field("fnol_drivable") == "yes"
++    result = client.create_claim(
++        idempotency_key=_get_or_create_idempotency_key(call),
++        policy_number=call.get_variable("fnol_policy_number"),
++        loss_type=call.get_field("fnol_loss_type"),
++        loss_at=as_datetime(call.get_field("fnol_loss_at")),
++        loss_location=call.get_field("fnol_loss_location"),
++        description=call.get_field("fnol_loss_description"),
++        injuries=False,
++        drivable=drivable,
++        police_report_filed=call.get_field("fnol_police_report_filed"),
++        police_report_number=call.get_field("fnol_police_report_number"),
++        police_department=call.get_field("fnol_police_department"),
++        details=details,
++    )
+ 
++    match result:
++        case Ok(value):
++            call.set_variable("fnol_claim_number", value.claim_number)
++            if not drivable:
++                call.set_task(
++                    "fnol_tow_offer",
++                    objective=(
++                        "The vehicle isn't drivable. Offer to arrange a tow. If they want one, find "
++                        "out where it should go; if not, that's fine."
++                    ),
++                    checklist=[
++                        guava.Field(
++                            key="fnol_tow_destination",
++                            description=(
++                                "Where the caller wants the vehicle towed, or that they don't want a "
++                                "tow arranged right now"
++                            ),
++                            field_type="multiple_choice",
++                            choices=["preferred_shop", "home", "other", "decline"],
++                            required=True,
++                        ),
++                        guava.Field(
++                            key="fnol_tow_destination_address",
++                            description="The destination address for the tow, if they want one",
++                            field_type="text",
++                            required=False,
++                        ),
++                    ],
++                )
++            else:
++                _finish_claim(call, value.claim_number)
++        case _:
++            # H6: backend unavailable (or a malformed response) even after
++            # the client's retry. Never say "filed."
++            transfer_to_human(
++                call,
++                instructions=(
++                    "Let the caller know the claim could not be submitted right now due to a system "
++                    "issue. Apologize, and connect them with a representative who can help. Do not "
++                    "say the claim was filed or saved."
++                ),
++            )
++
++
++def _finish_claim(call: guava.Call, claim_number: str) -> None:
++    policyholder = call.get_variable("fnol_policyholder_name")
+     call.hangup(
+         final_instructions=(
+-            f"Let {policyholder} know that their claim has been filed successfully. "
+-            f"Their claim number is {claim_number}. A licensed adjuster will contact "
+-            f"them within one business day to discuss next steps. A confirmation email "
+-            f"will be sent to the address on file. Thank them for calling and let them "
+-            f"know Keystone is here to help, and politely say goodbye."
++            f"Let {policyholder} know their claim has been filed successfully. Their claim number "
++            f"is {claim_number}. A representative will follow up -- do not give a specific timeline "
++            f"or promise a callback window. Thank them for calling, and politely say goodbye."
+         )
+     )
+ 
+ 
+-@agent.on_task_complete("collect_auto_details")
+-def on_auto_details(call: guava.Call) -> None:
+-    _finalize_claim(call)
++@_agent.on_task_complete("fnol_tow_offer")
++def _on_tow_offer_complete(call: guava.Call) -> None:
++    if needs_handoff(call):
++        transfer_to_human(call)
++        return
+ 
++    claim_number = call.get_variable("fnol_claim_number")
++    destination = call.get_field("fnol_tow_destination")
++    policyholder = call.get_variable("fnol_policyholder_name")
+ 
+-@agent.on_task_complete("collect_property_details")
+-def on_property_details(call: guava.Call) -> None:
+-    _finalize_claim(call)
++    if destination == "decline":
++        _finish_claim(call, claim_number)
++        return
+ 
++    result = client.request_tow(
++        claim_number=claim_number,
++        pickup_address=call.get_field("fnol_vehicle_location"),
++        destination_type=destination,
++        destination_address=call.get_field("fnol_tow_destination_address"),
++    )
++    match result:
++        case Ok(value):
++            call.hangup(
++                final_instructions=(
++                    f"Let {policyholder} know their claim number is {claim_number}, and that you've "
++                    f"requested a tow -- {value.provider_name} is expected in approximately "
++                    f"{value.eta_minutes} minutes. Make clear the ETA is approximate. A representative "
++                    f"will follow up on the claim. Thank them and politely say goodbye."
++                )
++            )
++        case _:
++            call.hangup(
++                final_instructions=(
++                    f"Let {policyholder} know their claim number is {claim_number}. Let them know the "
++                    f"tow could not be requested right now due to a system issue, and that a "
++                    f"representative will follow up and can help arrange one. Do NOT say a tow has "
++                    f"been requested. Thank them and politely say goodbye."
++                )
++            )
+ 
+-@agent.on_task_complete("collect_general_details")
+-def on_general_details(call: guava.Call) -> None:
+-    _finalize_claim(call)
+ 
+-
+-@agent.on_question
+-def on_question(call: guava.Call, question: str) -> str:
++def handle_question(call: guava.Call, question: str) -> str:
++    # H9: coverage/legal/fault questions are deflected to a human; the
++    # agent does intake only.
+     return (
+-        "I'm not able to make any determinations about coverage or claim outcomes. "
+-        "That will be handled by your assigned adjuster, who will review all the "
+-        "details of your case. For now, let's make sure we capture everything you "
+-        "need to report."
++        "I'm not able to make any determinations about coverage, fault, or how this claim will be "
++        "resolved -- that's handled by the adjuster assigned to your claim. Let's make sure we "
++        "capture everything you need to report first."
+     )
+ 
+ 
+-@agent.on_action_request
+-def on_action_request(call: guava.Call, intent_summary: str):
+-    return _mid_call_intent.classify(intent_summary)
++def classify_intent(intent_summary: str):
++    return _intent.classify(intent_summary)
+ 
+ 
+-@agent.on_action("speak_to_adjuster")
+-def handle_transfer(call: guava.Call) -> None:
+-    call.transfer(
+-        destination=ADJUSTER_LINE,
+-        instructions=(
+-            "Let the caller know you're connecting them with a claims representative "
+-            "now. Let them know that any information collected so far has been saved."
+-        ),
+-    )
+-
+-
+-@agent.on_action("withdraw")
+-def handle_withdraw(call: guava.Call) -> None:
+-    call.hangup(
+-        final_instructions=(
+-            "Let them know that's completely fine. No claim has been filed yet. "
+-            "They can call back anytime during business hours to start the process "
+-            "again, and wish them well, and politely say goodbye."
+-        )
+-    )
+-
+-
+-@agent.on_session_end
+-def on_session_end(call: guava.Call, event: BotSessionEnded) -> None:
+-    results = {
+-        "timestamp": datetime.now(timezone.utc).isoformat(),
+-        "use_case": "first_notice_of_loss",
+-        "policyholder_name": call.get_variable("policyholder_name"),
+-        "policy_number": call.get_variable("policy_number"),
+-        "loss_type": call.get_variable("loss_type"),
+-        "claim_number": call.get_variable("claim_number"),
+-        "loss_date": call.get_field("loss_date"),
+-        "loss_description": call.get_field("loss_description"),
+-        "injuries_involved": call.get_field("injuries_involved"),
+-        "termination_reason": event.termination_reason,
+-        "dnc": event.dnc,
++def build_session_summary(call: guava.Call, event) -> dict:
++    return {
++        "policyholder_name": call.get_variable("fnol_policyholder_name"),
++        "policy_number": call.get_variable("fnol_policy_number"),
++        "claim_number": call.get_variable("fnol_claim_number"),
++        "identity_attempts": call.get_variable("fnol_identity_attempts"),
+     }
+-    print(json.dumps(results, indent=2))
+ 
+ 
+-if __name__ == "__main__":
+-    logging_utils.configure_logging()
+-
+-    parser = argparse.ArgumentParser(
+-        description="Inbound First Notice of Loss agent for Keystone Property & Casualty"
+-    )
+-    group = parser.add_mutually_exclusive_group(required=True)
+-    group.add_argument(
+-        "--phone", metavar="PHONE_NUMBER", nargs="?", const="", help="Listen for phone calls."
+-    )
+-    group.add_argument(
+-        "--webrtc", metavar="WEBRTC_CODE", nargs="?", const="", help="Listen on a WebRTC code."
+-    )
+-    group.add_argument("--local", action="store_true", help="Start a local call.")
+-    group.add_argument("--sip", metavar="SIP_CODE", help="Listen on a SIP code 'guavasip-...'.")
+-    group.add_argument(
+-        "--call", metavar="PHONE_NUMBER", help="Place an outbound call for testing."
+-    )
+-    parser.add_argument(
+-        "--from-number", metavar="FROM_NUMBER", help="Caller ID for --call mode."
+-    )
+-    args = parser.parse_args()
+-
+-    if args.call:
+-        agent.call_phone(args.from_number or "", args.call)
+-    elif args.phone is not None:
+-        agent.listen_phone(args.phone)
+-    elif args.webrtc is not None:
+-        agent.listen_webrtc(args.webrtc or None)
+-    elif args.sip:
+-        agent.listen_sip(args.sip)
+-    else:
+-        agent.call_local()
++register_flow(
++    "fnol",
++    FlowHandlers(
++        start=start,
++        handle_question=handle_question,
++        classify_intent=classify_intent,
++        build_session_summary=build_session_summary,
++    ),
++)

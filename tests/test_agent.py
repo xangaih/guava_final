@@ -27,7 +27,12 @@ def test_on_call_start_reads_disclosure_and_sets_route_task():
     assert task_commands[0].task_id == agent_module.ROUTE_TASK
 
 
-def test_route_to_unbuilt_flow_transfers_to_human():
+def test_route_to_unbuilt_flow_transfers_to_human(monkeypatch):
+    # Flow modules register themselves process-wide at import time, so
+    # whether "fnol"/"tow" are present here depends on which other test
+    # files pytest already imported. Force the "not built yet" case
+    # directly instead of relying on import order.
+    monkeypatch.delitem(agent_module._flows, "fnol", raising=False)
     call = _call()
     call.set_field("call_purpose", "report_new_claim")
     agent_module.on_route_complete(call)

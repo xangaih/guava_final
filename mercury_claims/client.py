@@ -174,3 +174,7 @@ class Client:
                 logger.error("/call-sessions: audit write failed (HTTP %d)", resp.status_code)
         except httpx.HTTPError as exc:
             logger.error("/call-sessions: audit write failed (%s)", exc)
+
+
+# One shared instance (one connection pool) for every flow module.
+client = Client()
