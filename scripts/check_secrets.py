@@ -16,7 +16,8 @@ PATTERNS = [
     ("JWT (legacy Supabase keys are JWTs)", re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}")),
     ("connection string with a password", re.compile(r"postgres(?:ql)?://[^\s:@/]+:[^\s@/]+@")),
     ("credential assigned a value", re.compile(
-        r"(?i)\b(GUAVA_API_KEY|SUPABASE_SECRET_KEY|SUPABASE_SERVICE_ROLE_KEY|SUPABASE_DB_PASSWORD|DATABASE_PASSWORD|DB_PASSWORD)\b\s*[:=]\s*[\"']?[^\s\"'<>]{6,}")),
+        r"(?i)\b(GUAVA_API_KEY|SUPABASE_SECRET_KEY|SUPABASE_SERVICE_ROLE_KEY|SUPABASE_DB_PASSWORD|DATABASE_PASSWORD|DB_PASSWORD)\b"
+        r"\s*[:=]\s*(?!os\.environ|os\.getenv)[\"']?[^\s\"'<>]{6,}")),
 ]
 SELF = "scripts/check_secrets.py"
 
