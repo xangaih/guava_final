@@ -94,3 +94,18 @@ STATUS_TRANSFER_NO_REASON = (
     "further. Do not mention, speculate about, or confirm any reason for the current status, and "
     "do not state any dollar amount."
 )
+
+# H9: coverage/cost questions specific to the caller are deflected, not
+# answered -- that's a determination only a human can make.
+COVERAGE_DEFLECTION = (
+    "I'm not able to tell you whether this is covered under your specific policy, or what it "
+    "would cost -- that depends on your policy details. I can connect you with a representative "
+    "who can look that up for you."
+)
+
+# Used when the FAQ itself is unavailable (failed to initialize, or the
+# question couldn't be answered) -- never invent an answer instead.
+FAQ_DEFLECTION = (
+    "I don't have an answer to that readily available. Let me connect you with someone who can "
+    "help."
+)
