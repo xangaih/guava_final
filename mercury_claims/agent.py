@@ -24,6 +24,7 @@ import guava
 from guava.events import BotSessionEnded
 
 from . import config, copy
+from .client import client
 
 logger = logging.getLogger("mercury_claims.agent")
 
@@ -115,25 +116,102 @@ def needs_handoff(call: guava.Call) -> bool:
     return call.get_variable("handoff_reason") is not None
 
 
+# --- call_sessions audit (C14) ---
+#
+# "claim_created" | "status_delivered" | "transferred" | "auth_failed" |
+# "abandoned" | "error" | "completed". A flow calls set_outcome() at each
+# terminal branch (identity failure, backend-down, successful delivery,
+# transfer, etc.); on_session_end reads it back and writes the audit row.
+# If a call ends without ever reaching a terminal branch (the caller just
+# hangs up mid-task), outcome stays unset and on_session_end reports it
+# as "abandoned" -- that's what the value is for.
+#
+# Confirmed live (2026-10-05): a claim was successfully filed, then,
+# while the call was winding down, a benign follow-up question ("do you
+# need my insurance carrier?") was misclassified by the mid-call intent
+# recognizer as "wants a human" and triggered a real transfer. The audit
+# row ended up saying outcome=transferred with no sign a claim had ever
+# been created -- the later call silently overwrote the earlier one.
+# A genuine success must not be erased by a transfer that happens after
+# the caller's actual purpose was already fulfilled, so once a terminal
+# success is recorded, a later non-success call only annotates the
+# transfer reason instead of overwriting the outcome.
+
+_TERMINAL_SUCCESS_OUTCOMES = {"claim_created", "status_delivered", "completed"}
+
+
+def set_outcome(call: guava.Call, outcome: str, *, transfer_reason: str | None = None) -> None:
+    existing = call.get_variable("call_outcome")
+    if existing in _TERMINAL_SUCCESS_OUTCOMES and outcome not in _TERMINAL_SUCCESS_OUTCOMES:
+        if transfer_reason is not None:
+            call.set_variable("call_transfer_reason", f"post_completion:{transfer_reason}")
+        return
+    call.set_variable("call_outcome", outcome)
+    if transfer_reason is not None:
+        call.set_variable("call_transfer_reason", transfer_reason)
+
+
+_REDACTED_NAME_KEYS = ("policyholder_name", "name")
+_REDACTED_POLICY_KEYS = ("policy_number",)
+_REDACTED_DOB_KEYS = ("dob",)
+
+
+def _redact_summary(summary: dict) -> dict:
+    # Local application logs should be PII-free (C14), same principle as
+    # the backend's own masked logging -- this is a different sink than
+    # the call_sessions table (which never receives these fields at all).
+    redacted = {}
+    for key, value in summary.items():
+        if value is None:
+            redacted[key] = value
+        elif any(k in key for k in _REDACTED_DOB_KEYS):
+            redacted[key] = "****-**-**"
+        elif any(k in key for k in _REDACTED_POLICY_KEYS):
+            redacted[key] = f"{str(value)[:4]}***"
+        elif any(k in key for k in _REDACTED_NAME_KEYS):
+            redacted[key] = "<redacted>"
+        else:
+            redacted[key] = value
+    return redacted
+
+
 # --- Typed-field coercion ---
 #
 # The SDK's ActionItemCompletedEvent carries `payload: Any` with no local
-# type coercion (verified against the installed source); the runtime type
-# of a "date"/"datetime" field's value is whatever the server sends, which
-# isn't visible from this package. These accept either an already-parsed
-# object or an ISO-8601 string, so flow code doesn't have to assume.
+# type coercion (verified against the installed source). Confirmed live
+# (2026-10-05, real phone call): a "date" field's payload is a dict,
+# {'day': 12, 'month': 4, 'year': 1988} -- not an ISO string, not a
+# datetime.date. str(value).fromisoformat() on that dict crashed
+# on_task_complete uncaught, which didn't fail cleanly: the SDK caught
+# the exception and sent an ExpertErrorCommand, but the model just
+# stalled ("one moment... still looking into this...") for over a
+# minute before giving up confused. A "datetime" field's shape wasn't
+# reached in that call (it crashed on the DOB field first); the
+# hour/minute/second handling below is inferred from the same pattern,
+# not independently confirmed -- flagging that.
 
 def as_date(value: object) -> date:
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
         return value
+    if isinstance(value, dict):
+        return date(int(value["year"]), int(value["month"]), int(value["day"]))
     return date.fromisoformat(str(value))
 
 
 def as_datetime(value: object) -> datetime:
     if isinstance(value, datetime):
         return value
+    if isinstance(value, dict):
+        return datetime(
+            int(value["year"]),
+            int(value["month"]),
+            int(value["day"]),
+            int(value.get("hour", 0)),
+            int(value.get("minute", 0)),
+            int(value.get("second", 0)),
+        )
     text = str(value)
     try:
         return datetime.fromisoformat(text)
@@ -177,6 +255,7 @@ def on_route_complete(call: guava.Call) -> None:
 
     if flow_name is None:
         # "something_else", or anything unrecognized.
+        set_outcome(call, "transferred", transfer_reason="something_else")
         transfer_to_human(call)
         return
 
@@ -185,6 +264,7 @@ def on_route_complete(call: guava.Call) -> None:
         # Listed as a call type in scope (section 1) but not built yet
         # in this codebase.
         logger.warning("no flow registered for %r yet", flow_name)
+        set_outcome(call, "transferred", transfer_reason="flow_not_built")
         transfer_to_human(call)
         return
 
@@ -213,6 +293,7 @@ def on_transfer_to_human(call: guava.Call) -> None:
     # H3 (asks for a person/supervisor) and H4 (disputes fault, mentions
     # attorney/lawsuit/complaint) both just mean "transfer" -- one shared
     # action key avoids every flow registering its own near-duplicate.
+    set_outcome(call, "transferred", transfer_reason="mid_call_intent")
     transfer_to_human(call)
 
 
@@ -220,10 +301,23 @@ def on_transfer_to_human(call: guava.Call) -> None:
 def on_session_end(call: guava.Call, event: BotSessionEnded) -> None:
     handlers = _current_flow(call)
     summary = handlers.build_session_summary(call, event) if handlers and handlers.build_session_summary else {}
+    outcome = call.get_variable("call_outcome") or "abandoned"
+
+    # Audit write; failure here must never be fatal to the call -- it
+    # already isn't, since record_call_session only ever logs on failure.
+    client.record_call_session(
+        call_id=call.id,
+        purpose=call.get_variable("flow"),
+        outcome=outcome,
+        transfer_reason=call.get_variable("call_transfer_reason"),
+        claim_number=summary.get("claim_number"),
+    )
+
     logger.info(
-        "call ended: flow=%s termination_reason=%s dnc=%s %s",
+        "call ended: flow=%s outcome=%s termination_reason=%s dnc=%s %s",
         call.get_variable("flow"),
+        outcome,
         event.termination_reason,
         event.dnc,
-        summary,
+        _redact_summary(summary),
     )

@@ -13,7 +13,7 @@ roadside line (H11) -- real dispatch is out of scope.
 import guava
 
 from . import config, copy, faq
-from .agent import FlowHandlers, needs_handoff, register_flow, transfer_to_human
+from .agent import FlowHandlers, needs_handoff, register_flow, set_outcome, transfer_to_human
 from .agent import agent as _agent
 
 _PERSONAL_COVERAGE_KEYWORDS = (
@@ -75,12 +75,14 @@ def start(call: guava.Call) -> None:
 @_agent.on_task_complete("tow_intent")
 def _on_tow_intent_complete(call: guava.Call) -> None:
     if needs_handoff(call):
+        set_outcome(call, "transferred", transfer_reason="validation_exhausted")
         transfer_to_human(call)
         return
 
     if call.get_field("tow_needs_dispatch") == "yes":
         # H11: real dispatch is out of scope here -- hand off to the
         # roadside line.
+        set_outcome(call, "transferred", transfer_reason="roadside_dispatch_needed")
         call.transfer(
             destination=config.ROADSIDE_LINE_NUMBER,
             instructions=(
@@ -89,6 +91,10 @@ def _on_tow_intent_complete(call: guava.Call) -> None:
             ),
         )
     else:
+        # No enum value fits "FAQ answered, call ends normally" better
+        # than "completed" (0002 migration) -- it's genuinely not a
+        # claim, a status delivery, or a transfer.
+        set_outcome(call, "completed")
         call.hangup(final_instructions="Thank the caller for calling, and politely say goodbye.")
 
 

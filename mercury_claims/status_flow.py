@@ -23,6 +23,7 @@ from .agent import (
     bounded_validate,
     needs_handoff,
     register_flow,
+    set_outcome,
     transfer_to_human,
 )
 from .agent import agent as _agent
@@ -30,7 +31,15 @@ from .client import client
 from .models import Malformed, NotFound, Ok, Unavailable
 
 _intent = IntentRecognizer(
-    {"transfer_to_human": "The caller wants to speak to a human representative or supervisor"}
+    {
+        "transfer_to_human": (
+            "The caller explicitly asks to speak to a human, a representative, or a supervisor. "
+            "This does NOT include the caller asking about their own claim details or the status "
+            "lookup process -- those are normal parts of checking a claim, not a request for a "
+            "human. (Confirmed live: fnol_flow's broader version of this intent over-triggered on "
+            "a benign claim question; keeping this one narrow defensively.)"
+        )
+    }
 )
 
 _STATUS_INSTRUCTIONS = {
@@ -85,11 +94,20 @@ _agent.on_validate("status_zip")(bounded_validate("status_zip", _check_zip))
 @_agent.on_task_complete("status_identity")
 def _on_identity_complete(call: guava.Call) -> None:
     if needs_handoff(call):
+        set_outcome(call, "transferred", transfer_reason="validation_exhausted")
         transfer_to_human(call)
         return
 
     claim_number = call.get_field("status_claim_number")
-    dob = as_date(call.get_field("status_dob"))
+    try:
+        dob = as_date(call.get_field("status_dob"))
+    except (ValueError, KeyError, TypeError):
+        # Same belt-and-suspenders as fnol_flow's identity check: fail
+        # cleanly and immediately rather than crashing on_task_complete
+        # uncaught.
+        set_outcome(call, "error", transfer_reason="dob_unparseable")
+        transfer_to_human(call, instructions=copy.TRANSFER_BACKEND_DOWN)
+        return
     zip_code = call.get_field("status_zip")
     result = client.lookup_claim(claim_number, dob, zip_code)
 
@@ -111,6 +129,7 @@ def _on_identity_complete(call: guava.Call) -> None:
                     )
                 )
             else:
+                set_outcome(call, "auth_failed", transfer_reason="identity_mismatch")
                 transfer_to_human(
                     call,
                     instructions=(
@@ -120,21 +139,25 @@ def _on_identity_complete(call: guava.Call) -> None:
                     ),
                 )
         case Unavailable() | Malformed():
+            set_outcome(call, "error", transfer_reason="backend_unavailable")
             transfer_to_human(call, instructions=copy.TRANSFER_BACKEND_DOWN)
 
 
 def _deliver_status(call: guava.Call, status: str, adjuster_name: str | None, adjuster_phone: str | None) -> None:
     if status in ("denied", "needs_human"):
         # H8: warm transfer, never speak the reason.
+        set_outcome(call, "transferred", transfer_reason=f"status_{status}")
         transfer_to_human(call, instructions=copy.STATUS_TRANSFER_NO_REASON)
         return
 
     builder = _STATUS_INSTRUCTIONS.get(status)
     if builder is None:
         # An unknown or missing status counts as unavailable.
+        set_outcome(call, "error", transfer_reason="unrecognized_status")
         transfer_to_human(call, instructions=copy.TRANSFER_BACKEND_DOWN)
         return
 
+    set_outcome(call, "status_delivered")
     call.hangup(final_instructions=builder(adjuster_name, adjuster_phone))
 
 

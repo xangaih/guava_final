@@ -27,6 +27,7 @@ from .agent import (
     bounded_validate,
     needs_handoff,
     register_flow,
+    set_outcome,
     transfer_to_human,
 )
 from .agent import agent as _agent
@@ -36,12 +37,48 @@ from .models import Malformed, NotFound, Ok, Unavailable
 _intent = IntentRecognizer(
     {
         "transfer_to_human": (
-            "The caller wants to speak to a human representative or supervisor, disputes fault, "
-            "mentions an attorney, lawsuit, or complaint, or says they are not the person named on "
-            "the policy (calling on behalf of someone else)"
+            "The caller explicitly asks to speak to a human, a representative, or a supervisor; "
+            "disputes who was at fault; mentions a lawyer, attorney, lawsuit, or formal complaint; "
+            "or states that they are not the policyholder and are calling on someone else's behalf. "
+            "This does NOT include the caller asking what information is still needed, asking "
+            "about their own claim or vehicle details, or asking general questions about the "
+            "process -- those are normal parts of filing a claim, not a request for a human."
         ),
     }
 )
+
+# H9's deflection guard is deterministic (code), not another model call
+# stacked on top of the intent recognizer -- same reasoning as tow_flow's
+# guard. Confirmed live (2026-10-05): the single canned deflection was
+# returned for EVERY question, including benign ones like "what else do
+# you need?", which reads as a non-sequitur when the question has
+# nothing to do with coverage, fault, or legal liability.
+_COVERAGE_FAULT_LEGAL_KEYWORDS = (
+    "covered",
+    "coverage",
+    "my policy",
+    "deductible",
+    "premium",
+    "whose fault",
+    "my fault",
+    "at fault",
+    "liable",
+    "liability",
+    "lawsuit",
+    "attorney",
+    "lawyer",
+    "sue",
+    "complaint",
+    "how much will i",
+    "payout",
+    "pay out",
+    "settlement",
+)
+
+
+def _is_coverage_fault_or_legal(question: str) -> bool:
+    q = question.lower()
+    return any(kw in q for kw in _COVERAGE_FAULT_LEGAL_KEYWORDS)
 
 
 def _get_or_create_idempotency_key(call: guava.Call) -> str:
@@ -65,7 +102,7 @@ def _check_policy_number(value: object) -> tuple[bool, str]:
 def _check_loss_at_not_future(value: object) -> tuple[bool, str]:
     try:
         when = as_datetime(value)
-    except ValueError:
+    except (ValueError, KeyError, TypeError):
         return False, "I couldn't understand that date and time. Could you repeat it?"
     if when > datetime.now():
         return False, "That's in the future -- please confirm when the incident actually happened."
@@ -108,11 +145,21 @@ _agent.on_validate("fnol_loss_at")(bounded_validate("fnol_loss_at", _check_loss_
 @_agent.on_task_complete("fnol_identity")
 def _on_identity_complete(call: guava.Call) -> None:
     if needs_handoff(call):
+        set_outcome(call, "transferred", transfer_reason="validation_exhausted")
         transfer_to_human(call)
         return
 
     policy_number = call.get_field("fnol_policy_number")
-    dob = as_date(call.get_field("fnol_dob"))
+    try:
+        dob = as_date(call.get_field("fnol_dob"))
+    except (ValueError, KeyError, TypeError):
+        # Belt-and-suspenders: if the field payload is ever a shape
+        # as_date doesn't handle, fail cleanly and immediately instead of
+        # crashing on_task_complete uncaught -- that left a real call
+        # silently stalling for over a minute before giving up confused.
+        set_outcome(call, "error", transfer_reason="dob_unparseable")
+        transfer_to_human(call, instructions=copy.TRANSFER_BACKEND_DOWN)
+        return
     result = client.verify_policy(policy_number, dob)
 
     attempts = call.get_variable("fnol_identity_attempts", 0) + 1
@@ -180,6 +227,7 @@ def _on_identity_complete(call: guava.Call) -> None:
                     )
                 )
             else:
+                set_outcome(call, "auth_failed", transfer_reason="identity_mismatch")
                 transfer_to_human(
                     call,
                     instructions=(
@@ -191,6 +239,7 @@ def _on_identity_complete(call: guava.Call) -> None:
         case Unavailable() | Malformed():
             # H6: backend unavailable after the client's retry -- say so
             # honestly, never pretend identity was checked.
+            set_outcome(call, "error", transfer_reason="backend_unavailable")
             transfer_to_human(
                 call,
                 instructions=(
@@ -204,6 +253,7 @@ def _on_identity_complete(call: guava.Call) -> None:
 @_agent.on_task_complete("fnol_loss_basics")
 def _on_loss_basics_complete(call: guava.Call) -> None:
     if needs_handoff(call):
+        set_outcome(call, "transferred", transfer_reason="validation_exhausted")
         transfer_to_human(call)
         return
 
@@ -253,6 +303,7 @@ def _submit_partial_claim_for_injury(call: guava.Call) -> None:
         case Ok(value):
             # H2: injuries reported -> save a partial record, then
             # transfer. Only say "saved" because the write was confirmed.
+            set_outcome(call, "claim_created", transfer_reason="injury_reported")
             transfer_to_human(
                 call,
                 instructions=(
@@ -263,6 +314,7 @@ def _submit_partial_claim_for_injury(call: guava.Call) -> None:
                 ),
             )
         case _:
+            set_outcome(call, "error", transfer_reason="injury_reported_save_failed")
             transfer_to_human(
                 call,
                 instructions=(
@@ -277,6 +329,7 @@ def _submit_partial_claim_for_injury(call: guava.Call) -> None:
 @_agent.on_task_complete("fnol_vehicle")
 def _on_vehicle_complete(call: guava.Call) -> None:
     if needs_handoff(call):
+        set_outcome(call, "transferred", transfer_reason="validation_exhausted")
         transfer_to_human(call)
         return
     call.set_task(
@@ -299,6 +352,7 @@ def _on_vehicle_complete(call: guava.Call) -> None:
 @_agent.on_task_complete("fnol_police_report")
 def _on_police_report_complete(call: guava.Call) -> None:
     if needs_handoff(call):
+        set_outcome(call, "transferred", transfer_reason="validation_exhausted")
         transfer_to_human(call)
         return
     call.set_task(
@@ -318,6 +372,7 @@ def _on_police_report_complete(call: guava.Call) -> None:
 @_agent.on_task_complete("fnol_other_party")
 def _on_other_party_complete(call: guava.Call) -> None:
     if needs_handoff(call):
+        set_outcome(call, "transferred", transfer_reason="validation_exhausted")
         transfer_to_human(call)
         return
     _submit_claim(call)
@@ -391,6 +446,7 @@ def _submit_claim(call: guava.Call) -> None:
         case _:
             # H6: backend unavailable (or a malformed response) even after
             # the client's retry. Never say "filed."
+            set_outcome(call, "error", transfer_reason="claim_submit_failed")
             transfer_to_human(
                 call,
                 instructions=(
@@ -402,6 +458,7 @@ def _submit_claim(call: guava.Call) -> None:
 
 
 def _finish_claim(call: guava.Call, claim_number: str) -> None:
+    set_outcome(call, "claim_created")
     policyholder = call.get_variable("fnol_policyholder_name")
     call.hangup(
         final_instructions=(
@@ -415,6 +472,7 @@ def _finish_claim(call: guava.Call, claim_number: str) -> None:
 @_agent.on_task_complete("fnol_tow_offer")
 def _on_tow_offer_complete(call: guava.Call) -> None:
     if needs_handoff(call):
+        set_outcome(call, "transferred", transfer_reason="validation_exhausted")
         transfer_to_human(call)
         return
 
@@ -434,6 +492,7 @@ def _on_tow_offer_complete(call: guava.Call) -> None:
     )
     match result:
         case Ok(value):
+            set_outcome(call, "claim_created")
             call.hangup(
                 final_instructions=(
                     f"Let {policyholder} know their claim number is {claim_number}, and that you've "
@@ -443,6 +502,7 @@ def _on_tow_offer_complete(call: guava.Call) -> None:
                 )
             )
         case _:
+            set_outcome(call, "claim_created", transfer_reason="tow_request_failed")
             call.hangup(
                 final_instructions=(
                     f"Let {policyholder} know their claim number is {claim_number}. Let them know the "
@@ -454,13 +514,14 @@ def _on_tow_offer_complete(call: guava.Call) -> None:
 
 
 def handle_question(call: guava.Call, question: str) -> str:
-    # H9: coverage/legal/fault questions are deflected to a human; the
-    # agent does intake only.
-    return (
-        "I'm not able to make any determinations about coverage, fault, or how this claim will be "
-        "resolved -- that's handled by the adjuster assigned to your claim. Let's make sure we "
-        "capture everything you need to report first."
-    )
+    if _is_coverage_fault_or_legal(question):
+        # H9: coverage/fault/legal questions are deflected to a human;
+        # the agent does intake only, never a determination.
+        return copy.COVERAGE_DEFLECTION
+    # Anything else (process/meta questions like "what else do you
+    # need?"): acknowledge honestly instead of giving the coverage
+    # non-sequitur, and get back to the intake task.
+    return copy.INTAKE_QUESTION_ACKNOWLEDGMENT
 
 
 def classify_intent(intent_summary: str):

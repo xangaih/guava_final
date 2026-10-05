@@ -61,6 +61,7 @@ def test_s1_happy_path_drivable(monkeypatch):
     assert not _transfers(call)
     assert any("CLM-0001000" in text for text in _instructions(call))
     assert call.get_variable("fnol_claim_number") == "CLM-0001000"
+    assert call.get_variable("call_outcome") == "claim_created"
 
 
 def test_s2_wrong_dob_twice_transfers_without_leaking_which_field(monkeypatch):
@@ -80,6 +81,7 @@ def test_s2_wrong_dob_twice_transfers_without_leaking_which_field(monkeypatch):
     # Never names which specific field was wrong.
     assert "date of birth" not in message
     assert "policy number" not in message
+    assert call.get_variable("call_outcome") == "auth_failed"
 
 
 def test_s3_backend_500_on_submit_never_says_filed(monkeypatch):
@@ -98,6 +100,7 @@ def test_s3_backend_500_on_submit_never_says_filed(monkeypatch):
     message = transfers[0].transfer_message.lower()
     assert "could not be submitted" in message
     assert "not say the claim was filed" in message
+    assert call.get_variable("call_outcome") == "error"
 
 
 def test_s5_malformed_response_treated_as_unavailable(monkeypatch):
@@ -202,6 +205,35 @@ def test_h7_validator_exhaustion_transfers_instead_of_looping():
     assert call.get_variable("handoff_reason") == "validation_exhausted"
 
 
+def test_identity_handles_the_real_captured_dob_payload_shape(monkeypatch):
+    # Regression test for a live bug (2026-10-05): a "date" field's
+    # payload is {'day', 'month', 'year'}, not an ISO string. This
+    # crashed _on_identity_complete uncaught on a real call.
+    call = _call()
+    call.set_field("fnol_policy_number", "MCY-100245")
+    call.set_field("fnol_dob", {"day": 12, "month": 4, "year": 1988})
+    monkeypatch.setattr(
+        fnol_flow.client, "verify_policy", lambda *a, **k: Ok(PolicyVerification(verified=True, holder_name="Jordan Alvarez", status="active"))
+    )
+    fnol_flow._on_identity_complete(call)
+    assert not _transfers(call)
+    assert _tasks(call)[-1].task_id == "fnol_loss_basics"
+
+
+def test_identity_fails_cleanly_instead_of_crashing_on_unparseable_dob(monkeypatch):
+    # Belt-and-suspenders: even if some future payload shape isn't one
+    # as_date handles, this must transfer honestly, not crash the
+    # handler and leave the call stalling (what actually happened live
+    # before this fix).
+    call = _call()
+    call.set_field("fnol_policy_number", "MCY-100245")
+    call.set_field("fnol_dob", {"unexpected": "shape"})
+    fnol_flow._on_identity_complete(call)
+    transfers = _transfers(call)
+    assert len(transfers) == 1
+    assert call.get_variable("call_outcome") == "error"
+
+
 def test_lapsed_policy_is_not_rejected_by_the_agent(monkeypatch):
     # C6: the agent never sees or acts on policy status -- verify_policy
     # only returns verified/holder_name/status, and a lapsed policy still
@@ -216,6 +248,22 @@ def test_lapsed_policy_is_not_rejected_by_the_agent(monkeypatch):
     assert not _transfers(call)
     assert _tasks(call)[-1].task_id == "fnol_loss_basics"
     assert "coverage" not in " ".join(c.objective for c in _tasks(call)).lower()
+
+
+def test_handle_question_deflects_actual_coverage_fault_legal_questions():
+    call = _call()
+    for question in ["Is this covered by my policy?", "Whose fault was this?", "I'm going to call my attorney."]:
+        assert fnol_flow.handle_question(call, question) == fnol_flow.copy.COVERAGE_DEFLECTION
+
+
+def test_handle_question_acknowledges_benign_process_questions_instead_of_the_coverage_non_sequitur():
+    # Regression test for a live bug (2026-10-05): every question,
+    # including this one, got the coverage-deflection non-sequitur.
+    call = _call()
+    for question in ["What else do you need?", "What else did you ask for?", "Why do you need my license plate?"]:
+        answer = fnol_flow.handle_question(call, question)
+        assert answer == fnol_flow.copy.INTAKE_QUESTION_ACKNOWLEDGMENT
+        assert answer != fnol_flow.copy.COVERAGE_DEFLECTION
 
 
 def _complete_identity(call: MockCall, monkeypatch) -> None:

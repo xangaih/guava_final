@@ -1,3 +1,5 @@
+from datetime import date, datetime
+
 from guava.commands import ReadScriptCommand, SetTaskCommand, TransferCommand
 from guava.testing import MockCall
 from guava.types.call_info import PSTNCallInfo
@@ -96,3 +98,32 @@ def test_transfer_to_human_action():
     transfers = [c for c in call._command_queue if isinstance(c, TransferCommand)]
     assert len(transfers) == 1
     assert transfers[0].to_number == agent_module.config.HUMAN_LINE_NUMBER
+
+
+def test_as_date_handles_the_real_captured_payload_shape():
+    # Captured live, 2026-10-05: a "date" field's payload is this dict,
+    # not an ISO string and not a datetime.date. This crashed the
+    # original as_date() uncaught on a real call.
+    payload = {"day": 12, "month": 4, "year": 1988}
+    assert agent_module.as_date(payload) == date(1988, 4, 12)
+
+
+def test_as_date_still_handles_iso_string_and_date_object():
+    assert agent_module.as_date("1988-04-12") == date(1988, 4, 12)
+    assert agent_module.as_date(date(1988, 4, 12)) == date(1988, 4, 12)
+    assert agent_module.as_date(datetime(1988, 4, 12, 9, 30)) == date(1988, 4, 12)
+
+
+def test_as_datetime_handles_a_dict_payload_with_time_components():
+    payload = {"day": 1, "month": 10, "year": 2026, "hour": 12, "minute": 30, "second": 0}
+    assert agent_module.as_datetime(payload) == datetime(2026, 10, 1, 12, 30, 0)
+
+
+def test_as_datetime_dict_payload_defaults_missing_time_components_to_zero():
+    payload = {"day": 1, "month": 10, "year": 2026}
+    assert agent_module.as_datetime(payload) == datetime(2026, 10, 1, 0, 0, 0)
+
+
+def test_as_datetime_still_handles_iso_string_and_datetime_object():
+    assert agent_module.as_datetime("2026-10-01T12:30:00") == datetime(2026, 10, 1, 12, 30, 0)
+    assert agent_module.as_datetime(datetime(2026, 10, 1, 12, 30)) == datetime(2026, 10, 1, 12, 30)

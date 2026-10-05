@@ -109,3 +109,13 @@ FAQ_DEFLECTION = (
     "I don't have an answer to that readily available. Let me connect you with someone who can "
     "help."
 )
+
+# fnol_flow: a question during intake that isn't about coverage/fault/
+# legal (e.g. "what else do you need?") -- acknowledge honestly rather
+# than giving the coverage-deflection non-sequitur (confirmed live,
+# 2026-10-05, this was returned for every question regardless of
+# content).
+INTAKE_QUESTION_ACKNOWLEDGMENT = (
+    "I'm just gathering the details needed to get your claim started. If there's something "
+    "specific I can clarify about that, let me know -- otherwise, let's continue."
+)

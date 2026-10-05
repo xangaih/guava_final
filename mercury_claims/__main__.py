@@ -1,4 +1,5 @@
 import argparse
+import os
 
 from guava import logging_utils
 
@@ -20,7 +21,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.phone is not None:
-        agent.listen_phone(args.phone)
+        # Bare --phone (empty string) used to mean "use the account's
+        # registered number" in the original example; the live server now
+        # rejects an empty phone_number with a 400 ("You must provide
+        # exactly one parameter"). Falling back to GUAVA_AGENT_NUMBER
+        # (confirmed live, 2026-10-05) instead of requiring the number
+        # spelled out on every run.
+        agent.listen_phone(args.phone or os.environ.get("GUAVA_AGENT_NUMBER", ""))
     elif args.webrtc is not None:
         agent.listen_webrtc(args.webrtc or None)
     elif args.sip:

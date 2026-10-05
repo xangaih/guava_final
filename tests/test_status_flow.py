@@ -43,6 +43,7 @@ def test_s11_received_no_adjuster_assigned_invents_nothing(monkeypatch):
     assert "no representative has been assigned" in text
     # Never invents a name.
     assert "jordan" not in text and "morgan" not in text
+    assert call.get_variable("call_outcome") == "status_delivered"
 
 
 def test_received_with_adjuster_assigned(monkeypatch):
@@ -69,6 +70,7 @@ def test_s9_denied_transfers_without_speaking_reason(monkeypatch):
     message = transfers[0].transfer_message.lower()
     assert "do not mention, speculate about, or confirm any reason" in message
     assert "dollar" not in message or "do not state any dollar amount" in message
+    assert call.get_variable("call_outcome") == "transferred"
 
 
 def test_s12_needs_human_transfers_without_reason(monkeypatch):
@@ -136,3 +138,26 @@ def test_unknown_status_counts_as_unavailable(monkeypatch):
     status_flow._on_identity_complete(call)
     transfers = _transfers(call)
     assert len(transfers) == 1
+
+
+def test_identity_handles_the_real_captured_dob_payload_shape(monkeypatch):
+    # Regression test for the live bug found in fnol_flow (same as_date
+    # helper is shared by status_flow).
+    call = _call()
+    call.set_field("status_claim_number", "CLM-0000001")
+    call.set_field("status_dob", {"day": 12, "month": 4, "year": 1988})
+    call.set_field("status_zip", "90001")
+    monkeypatch.setattr(status_flow.client, "lookup_claim", lambda *a, **k: Ok(ClaimStatus(status="received")))
+    status_flow._on_identity_complete(call)
+    assert not _transfers(call)
+
+
+def test_identity_fails_cleanly_instead_of_crashing_on_unparseable_dob():
+    call = _call()
+    call.set_field("status_claim_number", "CLM-0000001")
+    call.set_field("status_dob", {"unexpected": "shape"})
+    call.set_field("status_zip", "90001")
+    status_flow._on_identity_complete(call)
+    transfers = _transfers(call)
+    assert len(transfers) == 1
+    assert call.get_variable("call_outcome") == "error"

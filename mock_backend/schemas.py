@@ -69,7 +69,8 @@ class CallSessionCreate(BaseModel):
     purpose: str | None = None
     outcome: (
         Literal[
-            "claim_created", "status_delivered", "transferred", "auth_failed", "abandoned", "error"
+            "claim_created", "status_delivered", "transferred", "auth_failed", "abandoned",
+            "error", "completed",
         ]
         | None
     ) = None

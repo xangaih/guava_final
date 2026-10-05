@@ -23,6 +23,7 @@ def test_needs_dispatch_transfers_to_roadside_line(monkeypatch):
     transfers = [c for c in call._command_queue if isinstance(c, TransferCommand)]
     assert len(transfers) == 1
     assert transfers[0].to_number == tow_flow.config.ROADSIDE_LINE_NUMBER
+    assert call.get_variable("call_outcome") == "transferred"
 
 
 def test_no_dispatch_needed_just_hangs_up():
@@ -32,6 +33,7 @@ def test_no_dispatch_needed_just_hangs_up():
     transfers = [c for c in call._command_queue if isinstance(c, TransferCommand)]
     assert not transfers
     assert any(isinstance(c, SendInstructionCommand) for c in call._command_queue)
+    assert call.get_variable("call_outcome") == "completed"
 
 
 def test_general_question_answered_from_faq(monkeypatch):
