@@ -1,0 +1,8 @@
+guava-sdk
+fastapi
+uvicorn[standard]
+supabase
+pydantic
+httpx
+python-dotenv
+pytest
