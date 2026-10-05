@@ -25,7 +25,7 @@ def _transfers(call: MockCall) -> list[TransferCommand]:
 
 
 def _set_identity_fields(call: MockCall) -> None:
-    call.set_field("status_claim_number", "CLM-0000001")
+    call.set_field("status_claim_number_digits", "0000001")
     call.set_field("status_dob", "1988-04-12")
     call.set_field("status_zip", "90001")
 
@@ -144,7 +144,7 @@ def test_identity_handles_the_real_captured_dob_payload_shape(monkeypatch):
     # Regression test for the live bug found in fnol_flow (same as_date
     # helper is shared by status_flow).
     call = _call()
-    call.set_field("status_claim_number", "CLM-0000001")
+    call.set_field("status_claim_number_digits", "0000001")
     call.set_field("status_dob", {"day": 12, "month": 4, "year": 1988})
     call.set_field("status_zip", "90001")
     monkeypatch.setattr(status_flow.client, "lookup_claim", lambda *a, **k: Ok(ClaimStatus(status="received")))
@@ -154,7 +154,7 @@ def test_identity_handles_the_real_captured_dob_payload_shape(monkeypatch):
 
 def test_identity_fails_cleanly_instead_of_crashing_on_unparseable_dob():
     call = _call()
-    call.set_field("status_claim_number", "CLM-0000001")
+    call.set_field("status_claim_number_digits", "0000001")
     call.set_field("status_dob", {"unexpected": "shape"})
     call.set_field("status_zip", "90001")
     status_flow._on_identity_complete(call)

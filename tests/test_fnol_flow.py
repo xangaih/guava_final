@@ -66,7 +66,7 @@ def test_s1_happy_path_drivable(monkeypatch):
 
 def test_s2_wrong_dob_twice_transfers_without_leaking_which_field(monkeypatch):
     call = _call()
-    call.set_field("fnol_policy_number", "MCY-100245")
+    call.set_field("fnol_policy_number_digits", "100245")
     call.set_field("fnol_dob", "1999-01-01")
     monkeypatch.setattr(fnol_flow.client, "verify_policy", lambda *a, **k: Ok(PolicyVerification(verified=False)))
 
@@ -198,7 +198,7 @@ def test_tow_decline_skips_tow_request(monkeypatch):
 
 def test_h7_validator_exhaustion_transfers_instead_of_looping():
     call = _call()
-    validator = fnol_flow._agent._on_validate_handlers["fnol_policy_number"]
+    validator = fnol_flow._agent._on_validate_handlers["fnol_policy_number_digits"]
     for _ in range(3):
         result = validator(call, "garbage")
     assert result is True  # gives up after 3, lets the task "complete"...
@@ -210,7 +210,7 @@ def test_identity_handles_the_real_captured_dob_payload_shape(monkeypatch):
     # payload is {'day', 'month', 'year'}, not an ISO string. This
     # crashed _on_identity_complete uncaught on a real call.
     call = _call()
-    call.set_field("fnol_policy_number", "MCY-100245")
+    call.set_field("fnol_policy_number_digits", "100245")
     call.set_field("fnol_dob", {"day": 12, "month": 4, "year": 1988})
     monkeypatch.setattr(
         fnol_flow.client, "verify_policy", lambda *a, **k: Ok(PolicyVerification(verified=True, holder_name="Jordan Alvarez", status="active"))
@@ -226,7 +226,7 @@ def test_identity_fails_cleanly_instead_of_crashing_on_unparseable_dob(monkeypat
     # handler and leave the call stalling (what actually happened live
     # before this fix).
     call = _call()
-    call.set_field("fnol_policy_number", "MCY-100245")
+    call.set_field("fnol_policy_number_digits", "100245")
     call.set_field("fnol_dob", {"unexpected": "shape"})
     fnol_flow._on_identity_complete(call)
     transfers = _transfers(call)
@@ -239,7 +239,7 @@ def test_lapsed_policy_is_not_rejected_by_the_agent(monkeypatch):
     # only returns verified/holder_name/status, and a lapsed policy still
     # returns verified=True. The flow must not hang up or mention coverage.
     call = _call()
-    call.set_field("fnol_policy_number", "MCY-100512")
+    call.set_field("fnol_policy_number_digits", "100512")
     call.set_field("fnol_dob", "1990-06-30")
     monkeypatch.setattr(
         fnol_flow.client, "verify_policy", lambda *a, **k: Ok(PolicyVerification(verified=True, holder_name="Evan Brooks", status="lapsed"))
@@ -266,8 +266,90 @@ def test_handle_question_acknowledges_benign_process_questions_instead_of_the_co
         assert answer != fnol_flow.copy.COVERAGE_DEFLECTION
 
 
+class _FakeGuavaClient:
+    def __init__(self, raise_on_send: bool = False):
+        self.raise_on_send = raise_on_send
+        self.sent: list[tuple[str, str, str]] = []
+
+    def send_sms(self, from_number: str, to_number: str, message: str) -> None:
+        if self.raise_on_send:
+            raise RuntimeError("sms failed")
+        self.sent.append((from_number, to_number, message))
+
+
+def test_sms_not_sent_when_flag_is_off(monkeypatch):
+    monkeypatch.setattr(fnol_flow.config, "SMS_CONFIRMATION_ENABLED", False)
+    fake = _FakeGuavaClient()
+    monkeypatch.setattr(fnol_flow.guava, "Client", lambda: fake)
+    call = _call()
+    assert fnol_flow._maybe_send_sms_confirmation(call, "CLM-0001000") is False
+    assert fake.sent == []
+
+
+def test_sms_not_sent_for_a_non_pstn_call(monkeypatch):
+    from guava.types.call_info import WebRTCCallInfo
+
+    monkeypatch.setattr(fnol_flow.config, "SMS_CONFIRMATION_ENABLED", True)
+    fake = _FakeGuavaClient()
+    monkeypatch.setattr(fnol_flow.guava, "Client", lambda: fake)
+    call = MockCall(call_info=WebRTCCallInfo(webrtc_code="grtc-test"))
+    assert fnol_flow._maybe_send_sms_confirmation(call, "CLM-0001000") is False
+    assert fake.sent == []
+
+
+def test_sms_not_sent_when_caller_has_no_from_number(monkeypatch):
+    monkeypatch.setattr(fnol_flow.config, "SMS_CONFIRMATION_ENABLED", True)
+    fake = _FakeGuavaClient()
+    monkeypatch.setattr(fnol_flow.guava, "Client", lambda: fake)
+    call = MockCall(call_info=PSTNCallInfo(from_number=None, to_number="+14843981776"))
+    assert fnol_flow._maybe_send_sms_confirmation(call, "CLM-0001000") is False
+    assert fake.sent == []
+
+
+def test_sms_sent_when_enabled_on_a_real_pstn_call(monkeypatch):
+    monkeypatch.setattr(fnol_flow.config, "SMS_CONFIRMATION_ENABLED", True)
+    fake = _FakeGuavaClient()
+    monkeypatch.setattr(fnol_flow.guava, "Client", lambda: fake)
+    call = _call()  # default call_info is PSTN with a from_number
+    assert fnol_flow._maybe_send_sms_confirmation(call, "CLM-0001000") is True
+    assert len(fake.sent) == 1
+    assert "CLM-0001000" in fake.sent[0][2]
+    assert "demo" in fake.sent[0][2].lower()
+
+
+def test_sms_send_failure_is_never_fatal_and_says_nothing_about_a_text(monkeypatch):
+    # Say-do: the API accepting the request isn't proof of delivery, so
+    # only a successful (non-raising) send may claim a text was sent.
+    monkeypatch.setattr(fnol_flow.config, "SMS_CONFIRMATION_ENABLED", True)
+    fake = _FakeGuavaClient(raise_on_send=True)
+    monkeypatch.setattr(fnol_flow.guava, "Client", lambda: fake)
+    call = _call()
+    assert fnol_flow._maybe_send_sms_confirmation(call, "CLM-0001000") is False
+    assert fnol_flow._sms_confirmation_note(call, "CLM-0001000") == ""
+
+
+def test_finish_claim_mentions_a_text_only_when_sms_actually_sent(monkeypatch):
+    monkeypatch.setattr(fnol_flow.config, "SMS_CONFIRMATION_ENABLED", True)
+    fake = _FakeGuavaClient()
+    monkeypatch.setattr(fnol_flow.guava, "Client", lambda: fake)
+    call = _call()
+    call.set_variable("fnol_policyholder_name", "Jordan Alvarez")
+    fnol_flow._finish_claim(call, "CLM-0001000")
+    instructions = _instructions(call)
+    assert any("text message" in text.lower() for text in instructions)
+
+
+def test_finish_claim_says_nothing_about_a_text_when_flag_is_off(monkeypatch):
+    monkeypatch.setattr(fnol_flow.config, "SMS_CONFIRMATION_ENABLED", False)
+    call = _call()
+    call.set_variable("fnol_policyholder_name", "Jordan Alvarez")
+    fnol_flow._finish_claim(call, "CLM-0001000")
+    instructions = _instructions(call)
+    assert not any("text message" in text.lower() for text in instructions)
+
+
 def _complete_identity(call: MockCall, monkeypatch) -> None:
-    call.set_field("fnol_policy_number", "MCY-100245")
+    call.set_field("fnol_policy_number_digits", "100245")
     call.set_field("fnol_dob", "1988-04-12")
     monkeypatch.setattr(
         fnol_flow.client, "verify_policy", lambda *a, **k: Ok(PolicyVerification(verified=True, holder_name="Jordan Alvarez", status="active"))

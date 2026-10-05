@@ -1,6 +1,6 @@
 --- originals/claims_status/__main__.py	2026-10-05 09:47:18
-+++ mercury_claims/status_flow.py	2026-10-05 11:00:43
-@@ -1,358 +1,170 @@
++++ mercury_claims/status_flow.py	2026-10-05 12:53:59
+@@ -1,358 +1,210 @@
 -# SDK conformance: guava-sdk 0.44.0 (2026-09-15)
 -import argparse
 -import json
@@ -81,6 +81,7 @@
 +    bounded_validate,
 +    needs_handoff,
 +    register_flow,
++    set_outcome,
 +    transfer_to_human,
 +)
 +from .agent import agent as _agent
@@ -107,7 +108,15 @@
 -        "when needed"
 -    ),
 +_intent = IntentRecognizer(
-+    {"transfer_to_human": "The caller wants to speak to a human representative or supervisor"}
++    {
++        "transfer_to_human": (
++            "The caller explicitly asks to speak to a human, a representative, or a supervisor. "
++            "This does NOT include the caller asking about their own claim details or the status "
++            "lookup process -- those are normal parts of checking a claim, not a request for a "
++            "human. (Confirmed live: fnol_flow's broader version of this intent over-triggered on "
++            "a benign claim question; keeping this one narrow defensively.)"
++        )
++    }
  )
  
 -_mid_call_intent = IntentRecognizer({
@@ -132,13 +141,14 @@
 -            f"{call.get_variable('contact_name')} regarding an open claim. "
 -            f"Please call us back at 1-800-555-0100 at your convenience. Thank you."
 -        ),
-+def _check_claim_number(value: object) -> tuple[bool, str]:
-+    if isinstance(value, str) and value.upper().startswith("CLM-") and len(value) >= 8:
++def _check_claim_number_digits(value: object) -> tuple[bool, str]:
++    text = str(value)
++    if text.isdigit() and len(text) == 7:
 +        return True, ""
 +    return (
 +        False,
-+        "That doesn't look like a valid claim number. It should start with CLM followed by a "
-+        "dash and a number of digits, like CLM-0001000.",
++        "I need exactly the 7 digits after CLM-dash, nothing else. Could you say or enter just "
++        "those 7 digits?",
      )
  
  
@@ -175,7 +185,13 @@
 -                guava.Say(
 -                    f"I have an update on your claim. Before I share any details, "
 -                    f"I need to verify your identity with a quick question."
--                ),
++            guava.Field(
++                key="status_claim_number_digits",
++                description=(
++                    "The 7 digits after 'CLM-' in the caller's claim number. The prefix is "
++                    "always CLM- and is not collected here. The caller may say the digits or "
++                    "enter them on their phone's keypad."
+                 ),
 -                guava.Field(
 -                    key="dob",
 -                    description="The claimant's date of birth for identity verification",
@@ -199,9 +215,16 @@
 -    else:
 -        logging.info("Could not reach %s (outcome: %s).", contact_name, outcome)
 -        call.hangup()
-+            guava.Field(key="status_claim_number", description="The caller's claim number (format: CLM-NNNNNNN)", field_type="text", required=True),
++                field_type="digit_sequence",
++                required=True,
++            ),
 +            guava.Field(key="status_dob", description="The claimant's date of birth, for identity verification", field_type="date", required=True),
-+            guava.Field(key="status_zip", description="The ZIP code on file for the policy", field_type="text", required=True),
++            guava.Field(
++                key="status_zip",
++                description="The ZIP code on file for the policy. The caller may say the digits or enter them on their phone's keypad.",
++                field_type="digit_sequence",
++                required=True,
++            ),
 +        ],
 +    )
  
@@ -211,7 +234,9 @@
 -    claim_number = call.get_variable("claim_number")
 -    dob = call.get_field("dob")
 -    claim = verify_identity(claim_number, dob)
-+_agent.on_validate("status_claim_number")(bounded_validate("status_claim_number", _check_claim_number))
++_agent.on_validate("status_claim_number_digits")(
++    bounded_validate("status_claim_number_digits", _check_claim_number_digits)
++)
 +_agent.on_validate("status_zip")(bounded_validate("status_zip", _check_zip))
  
 -    if claim is None:
@@ -228,24 +253,31 @@
 +@_agent.on_task_complete("status_identity")
 +def _on_identity_complete(call: guava.Call) -> None:
 +    if needs_handoff(call):
++        set_outcome(call, "transferred", transfer_reason="validation_exhausted")
 +        transfer_to_human(call)
          return
  
 -    call.set_variable("claim_status", claim["status"])
 -    call.set_variable("adjuster_number", claim["adjuster_number"])
-+    claim_number = call.get_field("status_claim_number")
-+    dob = as_date(call.get_field("status_dob"))
-+    zip_code = call.get_field("status_zip")
-+    result = client.lookup_claim(claim_number, dob, zip_code)
- 
+-
 -    call.add_info("claim_details", {
 -        "claim_number": claim_number,
 -        "status": claim["status"],
 -        "status_detail": claim["status_detail"],
 -        "adjuster": claim["adjuster"],
 -    })
-+    attempts = call.get_variable("status_identity_attempts", 0) + 1
-+    call.set_variable("status_identity_attempts", attempts)
++    claim_number = f"CLM-{call.get_field('status_claim_number_digits')}"
++    try:
++        dob = as_date(call.get_field("status_dob"))
++    except (ValueError, KeyError, TypeError):
++        # Same belt-and-suspenders as fnol_flow's identity check: fail
++        # cleanly and immediately rather than crashing on_task_complete
++        # uncaught.
++        set_outcome(call, "error", transfer_reason="dob_unparseable")
++        transfer_to_human(call, instructions=copy.TRANSFER_BACKEND_DOWN)
++        return
++    zip_code = call.get_field("status_zip")
++    result = client.lookup_claim(claim_number, dob, zip_code)
  
 -    if claim["status"] == "denied":
 -        call.set_task(
@@ -324,6 +356,9 @@
 -                ),
 -            ],
 -        )
++    attempts = call.get_variable("status_identity_attempts", 0) + 1
++    call.set_variable("status_identity_attempts", attempts)
+ 
 +    match result:
 +        case Ok(value):
 +            call.set_variable("status_claim_number", claim_number)
@@ -339,6 +374,7 @@
 +                    )
 +                )
 +            else:
++                set_outcome(call, "auth_failed", transfer_reason="identity_mismatch")
 +                transfer_to_human(
 +                    call,
 +                    instructions=(
@@ -348,17 +384,12 @@
 +                    ),
 +                )
 +        case Unavailable() | Malformed():
++            set_outcome(call, "error", transfer_reason="backend_unavailable")
 +            transfer_to_human(call, instructions=copy.TRANSFER_BACKEND_DOWN)
- 
  
 -@agent.on_task_complete("deliver_status")
 -def on_status_delivered(call: guava.Call) -> None:
 -    claim_status = call.get_variable("claim_status")
-+def _deliver_status(call: guava.Call, status: str, adjuster_name: str | None, adjuster_phone: str | None) -> None:
-+    if status in ("denied", "needs_human"):
-+        # H8: warm transfer, never speak the reason.
-+        transfer_to_human(call, instructions=copy.STATUS_TRANSFER_NO_REASON)
-+        return
  
 -    if claim_status == "denied" and call.get_field("wants_to_appeal") == "yes":
 -        adjuster_number = call.get_variable("adjuster_number")
@@ -377,19 +408,27 @@
 -                f"if they have any additional questions, and wish them well, and politely say goodbye."
 -            )
 -        )
++def _deliver_status(call: guava.Call, status: str, adjuster_name: str | None, adjuster_phone: str | None) -> None:
++    if status in ("denied", "needs_human"):
++        # H8: warm transfer, never speak the reason.
++        set_outcome(call, "transferred", transfer_reason=f"status_{status}")
++        transfer_to_human(call, instructions=copy.STATUS_TRANSFER_NO_REASON)
++        return
+ 
 +    builder = _STATUS_INSTRUCTIONS.get(status)
 +    if builder is None:
 +        # An unknown or missing status counts as unavailable.
++        set_outcome(call, "error", transfer_reason="unrecognized_status")
 +        transfer_to_human(call, instructions=copy.TRANSFER_BACKEND_DOWN)
 +        return
- 
-+    call.hangup(final_instructions=builder(adjuster_name, adjuster_phone))
  
 -@agent.on_action_request
 -def on_action_request(call: guava.Call, intent_summary: str):
 -    return _mid_call_intent.classify(intent_summary)
++    set_outcome(call, "status_delivered")
++    call.hangup(final_instructions=builder(adjuster_name, adjuster_phone))
  
--
+ 
 -@agent.on_action("do_not_contact")
 -def handle_dnc(call: guava.Call) -> None:
 -    logging.info("Claimant %s requested DNC mid-call.", call.get_variable("contact_name"))

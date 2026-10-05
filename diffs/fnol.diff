@@ -1,13 +1,11 @@
 --- originals/fnol/__main__.py	2026-10-05 09:47:18
-+++ mercury_claims/fnol_flow.py	2026-10-05 10:52:16
-@@ -1,474 +1,487 @@
++++ mercury_claims/fnol_flow.py	2026-10-05 12:53:29
+@@ -1,187 +1,296 @@
 -# SDK conformance: guava-sdk 0.44.0 (2026-09-15)
 -import argparse
 -import json
--import logging
--from datetime import datetime, time, timezone
 +"""Report a new auto claim. Descends from originals/fnol/__main__.py.
- 
++
 +Same task shape as the original (identity -> loss basics -> vehicle ->
 +police report -> other party -> submit, with a tow offer when the car
 +isn't drivable), but:
@@ -21,9 +19,11 @@
 +    H2, H5, H6, H7 are in code, not left to the model (C10)
 +"""
 +
+ import logging
+-from datetime import datetime, time, timezone
 +import uuid
 +from datetime import datetime
-+
+ 
  import guava
 -from guava import logging_utils
  from guava.helpers.llm import IntentRecognizer
@@ -31,7 +31,7 @@
  
 -BUSINESS_HOURS_START = time(8, 0)
 -BUSINESS_HOURS_END = time(18, 0)
-+from . import copy
++from . import config, copy
 +from .agent import (
 +    FlowHandlers,
 +    as_date,
@@ -39,6 +39,7 @@
 +    bounded_validate,
 +    needs_handoff,
 +    register_flow,
++    set_outcome,
 +    transfer_to_human,
 +)
 +from .agent import agent as _agent
@@ -46,12 +47,52 @@
 +from .models import Malformed, NotFound, Ok, Unavailable
  
 -ADJUSTER_LINE = "+15551000300"
--
--
++logger = logging.getLogger("mercury_claims.fnol_flow")
+ 
++_intent = IntentRecognizer(
++    {
++        "transfer_to_human": (
++            "The caller explicitly asks to speak to a human, a representative, or a supervisor; "
++            "disputes who was at fault; mentions a lawyer, attorney, lawsuit, or formal complaint; "
++            "or states that they are not the policyholder and are calling on someone else's behalf. "
++            "This does NOT include the caller asking what information is still needed, asking "
++            "about their own claim or vehicle details, or asking general questions about the "
++            "process -- those are normal parts of filing a claim, not a request for a human."
++        ),
++    }
++)
+ 
 -# ---------------------------------------------------------------------------
 -# Mock API — simulates policy lookup and claim creation
 -# ---------------------------------------------------------------------------
--
++# H9's deflection guard is deterministic (code), not another model call
++# stacked on top of the intent recognizer -- same reasoning as tow_flow's
++# guard. Confirmed live (2026-10-05): the single canned deflection was
++# returned for EVERY question, including benign ones like "what else do
++# you need?", which reads as a non-sequitur when the question has
++# nothing to do with coverage, fault, or legal liability.
++_COVERAGE_FAULT_LEGAL_KEYWORDS = (
++    "covered",
++    "coverage",
++    "my policy",
++    "deductible",
++    "premium",
++    "whose fault",
++    "my fault",
++    "at fault",
++    "liable",
++    "liability",
++    "lawsuit",
++    "attorney",
++    "lawyer",
++    "sue",
++    "complaint",
++    "how much will i",
++    "payout",
++    "pay out",
++    "settlement",
++)
+ 
 -MOCK_POLICIES = {
 -    "KPC-449821": {
 -        "policyholder": "Maria Santos",
@@ -72,43 +113,13 @@
 -        "status": "lapsed",
 -    },
 -}
--
--
+ 
++def _is_coverage_fault_or_legal(question: str) -> bool:
++    q = question.lower()
++    return any(kw in q for kw in _COVERAGE_FAULT_LEGAL_KEYWORDS)
+ 
 -def lookup_policy(policy_number):
 -    return MOCK_POLICIES.get(policy_number)
--
--
--def create_claim(policy_number, loss_type, details):
--    claim_number = f"CLM-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M')}"
--    logging.info("[MOCK API] POST /claims — created %s for policy %s", claim_number, policy_number)
--    return claim_number
--
--
--# ---------------------------------------------------------------------------
--# Agent
--# ---------------------------------------------------------------------------
--
--agent = guava.Agent(
--    name="Avery",
--    organization="Keystone Property & Casualty",
--    purpose=(
--        "assist policyholders with filing a First Notice of Loss and collecting "
--        "the details needed to open a new insurance claim"
--    ),
-+_intent = IntentRecognizer(
-+    {
-+        "transfer_to_human": (
-+            "The caller wants to speak to a human representative or supervisor, disputes fault, "
-+            "mentions an attorney, lawsuit, or complaint, or says they are not the person named on "
-+            "the policy (calling on behalf of someone else)"
-+        ),
-+    }
- )
- 
--_mid_call_intent = IntentRecognizer({
--    "speak_to_adjuster": "The caller wants to speak to a claims adjuster, live person, or supervisor",
--    "withdraw": "The caller wants to stop the process, hang up, or call back later",
--})
  
 +def _get_or_create_idempotency_key(call: guava.Call) -> str:
 +    key = call.get_variable("fnol_idempotency_key")
@@ -117,37 +128,62 @@
 +        call.set_variable("fnol_idempotency_key", key)
 +    return key
  
--def _is_business_hours():
--    now = datetime.now().time()
--    return BUSINESS_HOURS_START <= now < BUSINESS_HOURS_END
+-def create_claim(policy_number, loss_type, details):
+-    claim_number = f"CLM-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M')}"
+-    logging.info("[MOCK API] POST /claims — created %s for policy %s", claim_number, policy_number)
+-    return claim_number
  
-+def _check_policy_number(value: object) -> tuple[bool, str]:
-+    if isinstance(value, str) and value.upper().startswith("MCY-") and len(value) >= 8:
++def _check_policy_number_digits(value: object) -> tuple[bool, str]:
++    text = str(value)
++    if text.isdigit() and len(text) == 6:
 +        return True, ""
 +    return (
 +        False,
-+        "That doesn't look like a valid policy number. It should start with MCY followed by a "
-+        "dash and six digits, like MCY-100245.",
++        "I need exactly the 6 digits after MCY-dash, nothing else. Could you say or enter just "
++        "those 6 digits?",
 +    )
  
--@agent.on_call_received
--def on_call_received(call_info: guava.CallInfo) -> guava.IncomingCallAction:
--    if _is_business_hours():
--        return guava.AcceptCall()
--    return guava.DeclineCall()
+-# ---------------------------------------------------------------------------
+-# Agent
+-# ---------------------------------------------------------------------------
  
+-agent = guava.Agent(
+-    name="Avery",
+-    organization="Keystone Property & Casualty",
+-    purpose=(
+-        "assist policyholders with filing a First Notice of Loss and collecting "
+-        "the details needed to open a new insurance claim"
+-    ),
+-)
 +def _check_loss_at_not_future(value: object) -> tuple[bool, str]:
 +    try:
 +        when = as_datetime(value)
-+    except ValueError:
++    except (ValueError, KeyError, TypeError):
 +        return False, "I couldn't understand that date and time. Could you repeat it?"
 +    if when > datetime.now():
 +        return False, "That's in the future -- please confirm when the incident actually happened."
 +    return True, ""
  
+-_mid_call_intent = IntentRecognizer({
+-    "speak_to_adjuster": "The caller wants to speak to a claims adjuster, live person, or supervisor",
+-    "withdraw": "The caller wants to stop the process, hang up, or call back later",
+-})
+ 
+-
+-def _is_business_hours():
+-    now = datetime.now().time()
+-    return BUSINESS_HOURS_START <= now < BUSINESS_HOURS_END
+-
+-
+-@agent.on_call_received
+-def on_call_received(call_info: guava.CallInfo) -> guava.IncomingCallAction:
+-    if _is_business_hours():
+-        return guava.AcceptCall()
+-    return guava.DeclineCall()
+-
+-
 -@agent.on_call_start
 -def on_call_start(call: guava.Call) -> None:
-+
 +def start(call: guava.Call) -> None:
      call.set_task(
 -        "verify_policyholder",
@@ -171,9 +207,14 @@
              guava.Field(
 -                key="policy_number",
 -                description="The caller's policy number (format: KPC-NNNNNN)",
-+                key="fnol_policy_number",
-+                description="The caller's policy number (format: MCY-NNNNNN)",
-                 field_type="text",
+-                field_type="text",
++                key="fnol_policy_number_digits",
++                description=(
++                    "The 6 digits after 'MCY-' in the caller's policy number. The prefix is "
++                    "always MCY- and is not collected here. The caller may say the digits or "
++                    "enter them on their phone's keypad."
++                ),
++                field_type="digit_sequence",
                  required=True,
              ),
              guava.Field(
@@ -194,7 +235,9 @@
 -    if isinstance(value, str) and value.upper().startswith("KPC-") and len(value) >= 8:
 -        return True
 -    return (False, "That doesn't look like a valid policy number. It should start with KPC followed by a dash and six digits, like KPC-449821.")
-+_agent.on_validate("fnol_policy_number")(bounded_validate("fnol_policy_number", _check_policy_number))
++_agent.on_validate("fnol_policy_number_digits")(
++    bounded_validate("fnol_policy_number_digits", _check_policy_number_digits)
++)
 +_agent.on_validate("fnol_loss_at")(bounded_validate("fnol_loss_at", _check_loss_at_not_future))
  
  
@@ -206,6 +249,7 @@
 +@_agent.on_task_complete("fnol_identity")
 +def _on_identity_complete(call: guava.Call) -> None:
 +    if needs_handoff(call):
++        set_outcome(call, "transferred", transfer_reason="validation_exhausted")
 +        transfer_to_human(call)
 +        return
  
@@ -217,10 +261,27 @@
 -                "our records. For security, you cannot proceed. Suggest they double-check "
 -                "their policy number and try calling again, or visit the Keystone "
 -                "website for help locating their policy information, and politely say goodbye."
-+    policy_number = call.get_field("fnol_policy_number")
-+    dob = as_date(call.get_field("fnol_dob"))
+-            )
+-        )
++    policy_number = f"MCY-{call.get_field('fnol_policy_number_digits')}"
++    try:
++        dob = as_date(call.get_field("fnol_dob"))
++    except (ValueError, KeyError, TypeError):
++        # Belt-and-suspenders: if the field payload is ever a shape
++        # as_date doesn't handle, fail cleanly and immediately instead of
++        # crashing on_task_complete uncaught -- that left a real call
++        # silently stalling for over a minute before giving up confused.
++        set_outcome(call, "error", transfer_reason="dob_unparseable")
++        transfer_to_human(call, instructions=copy.TRANSFER_BACKEND_DOWN)
+         return
 +    result = client.verify_policy(policy_number, dob)
-+
+ 
+-    if policy["status"] == "lapsed":
+-        call.hangup(
+-            final_instructions=(
+-                "Let the caller know that their policy is no longer active. A claim "
+-                "cannot be filed against a lapsed policy. Suggest they contact their "
+-                "insurance agent to discuss reinstatement options, and politely say goodbye."
 +    attempts = call.get_variable("fnol_identity_attempts", 0) + 1
 +    call.set_variable("fnol_identity_attempts", attempts)
 +
@@ -276,13 +337,6 @@
              )
 -        )
 -        return
--
--    if policy["status"] == "lapsed":
--        call.hangup(
--            final_instructions=(
--                "Let the caller know that their policy is no longer active. A claim "
--                "cannot be filed against a lapsed policy. Suggest they contact their "
--                "insurance agent to discuss reinstatement options, and politely say goodbye."
 +        case Ok() | NotFound():
 +            # Same failure shape either way: wrong policy number or wrong
 +            # DOB look identical, so the caller can't learn which was
@@ -295,6 +349,7 @@
 +                    )
 +                )
 +            else:
++                set_outcome(call, "auth_failed", transfer_reason="identity_mismatch")
 +                transfer_to_human(
 +                    call,
 +                    instructions=(
@@ -306,6 +361,7 @@
 +        case Unavailable() | Malformed():
 +            # H6: backend unavailable after the client's retry -- say so
 +            # honestly, never pretend identity was checked.
++            set_outcome(call, "error", transfer_reason="backend_unavailable")
 +            transfer_to_human(
 +                call,
 +                instructions=(
@@ -313,9 +369,7 @@
 +                    "verify their identity right now. Apologize, and connect them with a "
 +                    "representative."
 +                ),
-             )
--        )
--        return
++            )
  
 -    call.set_variable("policyholder_name", policy["policyholder"])
 -    call.set_variable("policy_number", policy_number)
@@ -330,6 +384,7 @@
 +@_agent.on_task_complete("fnol_loss_basics")
 +def _on_loss_basics_complete(call: guava.Call) -> None:
 +    if needs_handoff(call):
++        set_outcome(call, "transferred", transfer_reason="validation_exhausted")
 +        transfer_to_human(call)
 +        return
  
@@ -368,13 +423,24 @@
 +                description="Whether the insured vehicle is still drivable",
                  field_type="multiple_choice",
 -                choices=["auto_collision", "auto_theft", "property_damage", "property_theft", "liability", "other"],
-+                choices=["yes", "no"],
+-                required=True,
+-            ),
+-            guava.Field(
+-                key="injuries_involved",
+-                description="Whether any injuries to any person were involved in this incident",
+-                field_type="multiple_choice",
+                 choices=["yes", "no"],
                  required=True,
              ),
-+        ],
-+    )
-+
-+
+@@ -189,286 +298,303 @@
+     )
+ 
+ 
+-@agent.on_task_complete("classify_loss")
+-def on_loss_classified(call: guava.Call) -> None:
+-    loss_type = call.get_field("loss_type")
+-    injuries = call.get_field("injuries_involved")
+-    policyholder = call.get_variable("policyholder_name")
 +def _submit_partial_claim_for_injury(call: guava.Call) -> None:
 +    result = client.create_claim(
 +        idempotency_key=_get_or_create_idempotency_key(call),
@@ -390,6 +456,7 @@
 +        case Ok(value):
 +            # H2: injuries reported -> save a partial record, then
 +            # transfer. Only say "saved" because the write was confirmed.
++            set_outcome(call, "claim_created", transfer_reason="injury_reported")
 +            transfer_to_human(
 +                call,
 +                instructions=(
@@ -400,6 +467,7 @@
 +                ),
 +            )
 +        case _:
++            set_outcome(call, "error", transfer_reason="injury_reported_save_failed")
 +            transfer_to_human(
 +                call,
 +                instructions=(
@@ -409,43 +477,47 @@
 +                    "claim outcome."
 +                ),
 +            )
-+
-+
+ 
+-    call.set_variable("loss_type", loss_type)
+ 
+-    if injuries == "yes":
+-        call.transfer(
+-            destination=ADJUSTER_LINE,
+-            instructions=(
+-                f"The caller ({policyholder}) has reported injuries as part of this incident. "
+-                f"Let them know that because injuries are involved, you need to connect them "
+-                f"with a licensed adjuster who can guide them through the next steps. "
+-                f"Reassure them that their information so far has been saved."
 +@_agent.on_task_complete("fnol_vehicle")
 +def _on_vehicle_complete(call: guava.Call) -> None:
 +    if needs_handoff(call):
++        set_outcome(call, "transferred", transfer_reason="validation_exhausted")
 +        transfer_to_human(call)
 +        return
 +    call.set_task(
 +        "fnol_police_report",
 +        objective="Find out whether a police report was filed for this incident.",
 +        checklist=[
-             guava.Field(
--                key="injuries_involved",
--                description="Whether any injuries to any person were involved in this incident",
++            guava.Field(
 +                key="fnol_police_report_filed",
 +                description="Whether a police report was filed for this incident",
-                 field_type="multiple_choice",
--                choices=["yes", "no"],
++                field_type="multiple_choice",
 +                choices=["yes", "no", "not sure"],
-                 required=True,
++                required=True,
              ),
+-        )
 +            guava.Field(key="fnol_police_report_number", description="The police report number, if known", field_type="text", required=False),
 +            guava.Field(key="fnol_police_department", description="The police department that responded, if known", field_type="text", required=False),
-         ],
-     )
- 
- 
--@agent.on_task_complete("classify_loss")
--def on_loss_classified(call: guava.Call) -> None:
--    loss_type = call.get_field("loss_type")
--    injuries = call.get_field("injuries_involved")
--    policyholder = call.get_variable("policyholder_name")
++        ],
++    )
++
++
 +@_agent.on_task_complete("fnol_police_report")
 +def _on_police_report_complete(call: guava.Call) -> None:
 +    if needs_handoff(call):
++        set_outcome(call, "transferred", transfer_reason="validation_exhausted")
 +        transfer_to_human(call)
-+        return
+         return
 +    call.set_task(
 +        "fnol_other_party",
 +        objective=(
@@ -458,25 +530,6 @@
 +            guava.Field(key="fnol_other_party_insurer", description="The other party's insurance company, if known", field_type="text", required=False),
 +        ],
 +    )
- 
--    call.set_variable("loss_type", loss_type)
- 
--    if injuries == "yes":
--        call.transfer(
--            destination=ADJUSTER_LINE,
--            instructions=(
--                f"The caller ({policyholder}) has reported injuries as part of this incident. "
--                f"Let them know that because injuries are involved, you need to connect them "
--                f"with a licensed adjuster who can guide them through the next steps. "
--                f"Reassure them that their information so far has been saved."
--            ),
--        )
-+@_agent.on_task_complete("fnol_other_party")
-+def _on_other_party_complete(call: guava.Call) -> None:
-+    if needs_handoff(call):
-+        transfer_to_human(call)
-         return
-+    _submit_claim(call)
  
 -    if loss_type in ("auto_collision", "auto_theft"):
 -        call.set_task(
@@ -613,12 +666,19 @@
 -            ],
 -        )
  
--
++@_agent.on_task_complete("fnol_other_party")
++def _on_other_party_complete(call: guava.Call) -> None:
++    if needs_handoff(call):
++        set_outcome(call, "transferred", transfer_reason="validation_exhausted")
++        transfer_to_human(call)
++        return
++    _submit_claim(call)
+ 
 -def _finalize_claim(call: guava.Call) -> None:
 -    policy_number = call.get_variable("policy_number")
 -    loss_type = call.get_variable("loss_type")
 -    policyholder = call.get_variable("policyholder_name")
--
+ 
 +def _submit_claim(call: guava.Call) -> None:
      details = {
 -        "loss_date": call.get_field("loss_date"),
@@ -642,6 +702,15 @@
      }
 -    claim_number = create_claim(policy_number, loss_type, details)
 -    call.set_variable("claim_number", claim_number)
+-
+-    call.hangup(
+-        final_instructions=(
+-            f"Let {policyholder} know that their claim has been filed successfully. "
+-            f"Their claim number is {claim_number}. A licensed adjuster will contact "
+-            f"them within one business day to discuss next steps. A confirmation email "
+-            f"will be sent to the address on file. Thank them for calling and let them "
+-            f"know Keystone is here to help, and politely say goodbye."
+-        )
 +    drivable = call.get_field("fnol_drivable") == "yes"
 +    result = client.create_claim(
 +        idempotency_key=_get_or_create_idempotency_key(call),
@@ -656,7 +725,7 @@
 +        police_report_number=call.get_field("fnol_police_report_number"),
 +        police_department=call.get_field("fnol_police_department"),
 +        details=details,
-+    )
+     )
  
 +    match result:
 +        case Ok(value):
@@ -692,6 +761,7 @@
 +        case _:
 +            # H6: backend unavailable (or a malformed response) even after
 +            # the client's retry. Never say "filed."
++            set_outcome(call, "error", transfer_reason="claim_submit_failed")
 +            transfer_to_human(
 +                call,
 +                instructions=(
@@ -700,97 +770,88 @@
 +                    "say the claim was filed or saved."
 +                ),
 +            )
-+
-+
-+def _finish_claim(call: guava.Call, claim_number: str) -> None:
-+    policyholder = call.get_variable("fnol_policyholder_name")
-     call.hangup(
-         final_instructions=(
--            f"Let {policyholder} know that their claim has been filed successfully. "
--            f"Their claim number is {claim_number}. A licensed adjuster will contact "
--            f"them within one business day to discuss next steps. A confirmation email "
--            f"will be sent to the address on file. Thank them for calling and let them "
--            f"know Keystone is here to help, and politely say goodbye."
-+            f"Let {policyholder} know their claim has been filed successfully. Their claim number "
-+            f"is {claim_number}. A representative will follow up -- do not give a specific timeline "
-+            f"or promise a callback window. Thank them for calling, and politely say goodbye."
-         )
-     )
- 
  
 -@agent.on_task_complete("collect_auto_details")
 -def on_auto_details(call: guava.Call) -> None:
 -    _finalize_claim(call)
-+@_agent.on_task_complete("fnol_tow_offer")
-+def _on_tow_offer_complete(call: guava.Call) -> None:
-+    if needs_handoff(call):
-+        transfer_to_human(call)
-+        return
  
-+    claim_number = call.get_variable("fnol_claim_number")
-+    destination = call.get_field("fnol_tow_destination")
-+    policyholder = call.get_variable("fnol_policyholder_name")
++# --- C15 (stretch): SMS confirmation of the claim number ---
++#
++# Off by default (SMS_CONFIRMATION_ENABLED). Only say "you've been
++# texted" if send_sms actually returned without raising -- the API
++# accepting the request is not proof the handset received it, so this
++# needs a real test on the demo phone before the flag is ever turned on
++# (see README). Scoped to the final successful-submission paths only
++# (drivable=yes finish, and both tow-offer outcomes) -- not the
++# injury-partial-claim path, which ends in a transfer, not a goodbye.
  
 -@agent.on_task_complete("collect_property_details")
 -def on_property_details(call: guava.Call) -> None:
 -    _finalize_claim(call)
-+    if destination == "decline":
-+        _finish_claim(call, claim_number)
-+        return
++def _maybe_send_sms_confirmation(call: guava.Call, claim_number: str) -> bool:
++    if not config.SMS_CONFIRMATION_ENABLED:
++        return False
++    info = call.call_info
++    if getattr(info, "call_type", None) != "pstn":
++        return False
++    from_number = getattr(info, "from_number", None)
++    if not from_number:
++        return False
++    try:
++        guava.Client().send_sms(
++            from_number=config.GUAVA_AGENT_NUMBER,
++            to_number=from_number,
++            message=f"Mercury Insurance (demo): your claim number is {claim_number}. This is a demo text, not a real claim.",
++        )
++        return True
++    except Exception:
++        logger.exception("send_sms failed for claim %s", claim_number)
++        return False
  
-+    result = client.request_tow(
-+        claim_number=claim_number,
-+        pickup_address=call.get_field("fnol_vehicle_location"),
-+        destination_type=destination,
-+        destination_address=call.get_field("fnol_tow_destination_address"),
-+    )
-+    match result:
-+        case Ok(value):
-+            call.hangup(
-+                final_instructions=(
-+                    f"Let {policyholder} know their claim number is {claim_number}, and that you've "
-+                    f"requested a tow -- {value.provider_name} is expected in approximately "
-+                    f"{value.eta_minutes} minutes. Make clear the ETA is approximate. A representative "
-+                    f"will follow up on the claim. Thank them and politely say goodbye."
-+                )
-+            )
-+        case _:
-+            call.hangup(
-+                final_instructions=(
-+                    f"Let {policyholder} know their claim number is {claim_number}. Let them know the "
-+                    f"tow could not be requested right now due to a system issue, and that a "
-+                    f"representative will follow up and can help arrange one. Do NOT say a tow has "
-+                    f"been requested. Thank them and politely say goodbye."
-+                )
-+            )
  
 -@agent.on_task_complete("collect_general_details")
 -def on_general_details(call: guava.Call) -> None:
 -    _finalize_claim(call)
++def _sms_confirmation_note(call: guava.Call, claim_number: str) -> str:
++    if _maybe_send_sms_confirmation(call, claim_number):
++        return " You've also been sent a text message confirming the claim number."
++    return ""
  
--
+ 
 -@agent.on_question
 -def on_question(call: guava.Call, question: str) -> str:
-+def handle_question(call: guava.Call, question: str) -> str:
-+    # H9: coverage/legal/fault questions are deflected to a human; the
-+    # agent does intake only.
-     return (
+-    return (
 -        "I'm not able to make any determinations about coverage or claim outcomes. "
 -        "That will be handled by your assigned adjuster, who will review all the "
 -        "details of your case. For now, let's make sure we capture everything you "
 -        "need to report."
-+        "I'm not able to make any determinations about coverage, fault, or how this claim will be "
-+        "resolved -- that's handled by the adjuster assigned to your claim. Let's make sure we "
-+        "capture everything you need to report first."
++def _finish_claim(call: guava.Call, claim_number: str) -> None:
++    set_outcome(call, "claim_created")
++    policyholder = call.get_variable("fnol_policyholder_name")
++    sms_note = _sms_confirmation_note(call, claim_number)
++    call.hangup(
++        final_instructions=(
++            f"Let {policyholder} know their claim has been filed successfully. Their claim number "
++            f"is {claim_number}.{sms_note} A representative will follow up -- do not give a "
++            f"specific timeline or promise a callback window. Thank them for calling, and politely "
++            f"say goodbye."
++        )
      )
  
  
 -@agent.on_action_request
 -def on_action_request(call: guava.Call, intent_summary: str):
 -    return _mid_call_intent.classify(intent_summary)
-+def classify_intent(intent_summary: str):
-+    return _intent.classify(intent_summary)
++@_agent.on_task_complete("fnol_tow_offer")
++def _on_tow_offer_complete(call: guava.Call) -> None:
++    if needs_handoff(call):
++        set_outcome(call, "transferred", transfer_reason="validation_exhausted")
++        transfer_to_human(call)
++        return
  
++    claim_number = call.get_variable("fnol_claim_number")
++    destination = call.get_field("fnol_tow_destination")
++    policyholder = call.get_variable("fnol_policyholder_name")
  
 -@agent.on_action("speak_to_adjuster")
 -def handle_transfer(call: guava.Call) -> None:
@@ -800,9 +861,42 @@
 -            "Let the caller know you're connecting them with a claims representative "
 -            "now. Let them know that any information collected so far has been saved."
 -        ),
--    )
--
--
++    if destination == "decline":
++        _finish_claim(call, claim_number)
++        return
++
++    result = client.request_tow(
++        claim_number=claim_number,
++        pickup_address=call.get_field("fnol_vehicle_location"),
++        destination_type=destination,
++        destination_address=call.get_field("fnol_tow_destination_address"),
+     )
++    match result:
++        case Ok(value):
++            set_outcome(call, "claim_created")
++            sms_note = _sms_confirmation_note(call, claim_number)
++            call.hangup(
++                final_instructions=(
++                    f"Let {policyholder} know their claim number is {claim_number}, and that you've "
++                    f"requested a tow -- {value.provider_name} is expected in approximately "
++                    f"{value.eta_minutes} minutes. Make clear the ETA is approximate.{sms_note} A "
++                    f"representative will follow up on the claim. Thank them and politely say "
++                    f"goodbye."
++                )
++            )
++        case _:
++            set_outcome(call, "claim_created", transfer_reason="tow_request_failed")
++            sms_note = _sms_confirmation_note(call, claim_number)
++            call.hangup(
++                final_instructions=(
++                    f"Let {policyholder} know their claim number is {claim_number}. Let them know the "
++                    f"tow could not be requested right now due to a system issue, and that a "
++                    f"representative will follow up and can help arrange one. Do NOT say a tow has "
++                    f"been requested.{sms_note} Thank them and politely say goodbye."
++                )
++            )
+ 
+ 
 -@agent.on_action("withdraw")
 -def handle_withdraw(call: guava.Call) -> None:
 -    call.hangup(
@@ -812,8 +906,17 @@
 -            "again, and wish them well, and politely say goodbye."
 -        )
 -    )
--
--
++def handle_question(call: guava.Call, question: str) -> str:
++    if _is_coverage_fault_or_legal(question):
++        # H9: coverage/fault/legal questions are deflected to a human;
++        # the agent does intake only, never a determination.
++        return copy.COVERAGE_DEFLECTION
++    # Anything else (process/meta questions like "what else do you
++    # need?"): acknowledge honestly instead of giving the coverage
++    # non-sequitur, and get back to the intake task.
++    return copy.INTAKE_QUESTION_ACKNOWLEDGMENT
+ 
+ 
 -@agent.on_session_end
 -def on_session_end(call: guava.Call, event: BotSessionEnded) -> None:
 -    results = {
@@ -828,19 +931,22 @@
 -        "injuries_involved": call.get_field("injuries_involved"),
 -        "termination_reason": event.termination_reason,
 -        "dnc": event.dnc,
+-    }
+-    print(json.dumps(results, indent=2))
++def classify_intent(intent_summary: str):
++    return _intent.classify(intent_summary)
+ 
+ 
+-if __name__ == "__main__":
+-    logging_utils.configure_logging()
 +def build_session_summary(call: guava.Call, event) -> dict:
 +    return {
 +        "policyholder_name": call.get_variable("fnol_policyholder_name"),
 +        "policy_number": call.get_variable("fnol_policy_number"),
 +        "claim_number": call.get_variable("fnol_claim_number"),
 +        "identity_attempts": call.get_variable("fnol_identity_attempts"),
-     }
--    print(json.dumps(results, indent=2))
++    }
  
- 
--if __name__ == "__main__":
--    logging_utils.configure_logging()
--
 -    parser = argparse.ArgumentParser(
 -        description="Inbound First Notice of Loss agent for Keystone Property & Casualty"
 -    )
@@ -860,7 +966,7 @@
 -        "--from-number", metavar="FROM_NUMBER", help="Caller ID for --call mode."
 -    )
 -    args = parser.parse_args()
--
+ 
 -    if args.call:
 -        agent.call_phone(args.from_number or "", args.call)
 -    elif args.phone is not None:

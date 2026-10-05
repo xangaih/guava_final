@@ -51,13 +51,14 @@ _STATUS_INSTRUCTIONS = {
 }
 
 
-def _check_claim_number(value: object) -> tuple[bool, str]:
-    if isinstance(value, str) and value.upper().startswith("CLM-") and len(value) >= 8:
+def _check_claim_number_digits(value: object) -> tuple[bool, str]:
+    text = str(value)
+    if text.isdigit() and len(text) == 7:
         return True, ""
     return (
         False,
-        "That doesn't look like a valid claim number. It should start with CLM followed by a "
-        "dash and a number of digits, like CLM-0001000.",
+        "I need exactly the 7 digits after CLM-dash, nothing else. Could you say or enter just "
+        "those 7 digits?",
     )
 
 
@@ -80,14 +81,30 @@ def start(call: guava.Call) -> None:
             guava.Say(
                 "I can help you check on an existing claim. First, I need to verify your identity."
             ),
-            guava.Field(key="status_claim_number", description="The caller's claim number (format: CLM-NNNNNNN)", field_type="text", required=True),
+            guava.Field(
+                key="status_claim_number_digits",
+                description=(
+                    "The 7 digits after 'CLM-' in the caller's claim number. The prefix is "
+                    "always CLM- and is not collected here. The caller may say the digits or "
+                    "enter them on their phone's keypad."
+                ),
+                field_type="digit_sequence",
+                required=True,
+            ),
             guava.Field(key="status_dob", description="The claimant's date of birth, for identity verification", field_type="date", required=True),
-            guava.Field(key="status_zip", description="The ZIP code on file for the policy", field_type="text", required=True),
+            guava.Field(
+                key="status_zip",
+                description="The ZIP code on file for the policy. The caller may say the digits or enter them on their phone's keypad.",
+                field_type="digit_sequence",
+                required=True,
+            ),
         ],
     )
 
 
-_agent.on_validate("status_claim_number")(bounded_validate("status_claim_number", _check_claim_number))
+_agent.on_validate("status_claim_number_digits")(
+    bounded_validate("status_claim_number_digits", _check_claim_number_digits)
+)
 _agent.on_validate("status_zip")(bounded_validate("status_zip", _check_zip))
 
 
@@ -98,7 +115,7 @@ def _on_identity_complete(call: guava.Call) -> None:
         transfer_to_human(call)
         return
 
-    claim_number = call.get_field("status_claim_number")
+    claim_number = f"CLM-{call.get_field('status_claim_number_digits')}"
     try:
         dob = as_date(call.get_field("status_dob"))
     except (ValueError, KeyError, TypeError):

@@ -13,13 +13,14 @@ isn't drivable), but:
     H2, H5, H6, H7 are in code, not left to the model (C10)
 """
 
+import logging
 import uuid
 from datetime import datetime
 
 import guava
 from guava.helpers.llm import IntentRecognizer
 
-from . import copy
+from . import config, copy
 from .agent import (
     FlowHandlers,
     as_date,
@@ -33,6 +34,8 @@ from .agent import (
 from .agent import agent as _agent
 from .client import client
 from .models import Malformed, NotFound, Ok, Unavailable
+
+logger = logging.getLogger("mercury_claims.fnol_flow")
 
 _intent = IntentRecognizer(
     {
@@ -89,13 +92,14 @@ def _get_or_create_idempotency_key(call: guava.Call) -> str:
     return key
 
 
-def _check_policy_number(value: object) -> tuple[bool, str]:
-    if isinstance(value, str) and value.upper().startswith("MCY-") and len(value) >= 8:
+def _check_policy_number_digits(value: object) -> tuple[bool, str]:
+    text = str(value)
+    if text.isdigit() and len(text) == 6:
         return True, ""
     return (
         False,
-        "That doesn't look like a valid policy number. It should start with MCY followed by a "
-        "dash and six digits, like MCY-100245.",
+        "I need exactly the 6 digits after MCY-dash, nothing else. Could you say or enter just "
+        "those 6 digits?",
     )
 
 
@@ -123,9 +127,13 @@ def start(call: guava.Call) -> None:
                 "started. First, I need to verify your identity."
             ),
             guava.Field(
-                key="fnol_policy_number",
-                description="The caller's policy number (format: MCY-NNNNNN)",
-                field_type="text",
+                key="fnol_policy_number_digits",
+                description=(
+                    "The 6 digits after 'MCY-' in the caller's policy number. The prefix is "
+                    "always MCY- and is not collected here. The caller may say the digits or "
+                    "enter them on their phone's keypad."
+                ),
+                field_type="digit_sequence",
                 required=True,
             ),
             guava.Field(
@@ -138,7 +146,9 @@ def start(call: guava.Call) -> None:
     )
 
 
-_agent.on_validate("fnol_policy_number")(bounded_validate("fnol_policy_number", _check_policy_number))
+_agent.on_validate("fnol_policy_number_digits")(
+    bounded_validate("fnol_policy_number_digits", _check_policy_number_digits)
+)
 _agent.on_validate("fnol_loss_at")(bounded_validate("fnol_loss_at", _check_loss_at_not_future))
 
 
@@ -149,7 +159,7 @@ def _on_identity_complete(call: guava.Call) -> None:
         transfer_to_human(call)
         return
 
-    policy_number = call.get_field("fnol_policy_number")
+    policy_number = f"MCY-{call.get_field('fnol_policy_number_digits')}"
     try:
         dob = as_date(call.get_field("fnol_dob"))
     except (ValueError, KeyError, TypeError):
@@ -457,14 +467,53 @@ def _submit_claim(call: guava.Call) -> None:
             )
 
 
+# --- C15 (stretch): SMS confirmation of the claim number ---
+#
+# Off by default (SMS_CONFIRMATION_ENABLED). Only say "you've been
+# texted" if send_sms actually returned without raising -- the API
+# accepting the request is not proof the handset received it, so this
+# needs a real test on the demo phone before the flag is ever turned on
+# (see README). Scoped to the final successful-submission paths only
+# (drivable=yes finish, and both tow-offer outcomes) -- not the
+# injury-partial-claim path, which ends in a transfer, not a goodbye.
+
+def _maybe_send_sms_confirmation(call: guava.Call, claim_number: str) -> bool:
+    if not config.SMS_CONFIRMATION_ENABLED:
+        return False
+    info = call.call_info
+    if getattr(info, "call_type", None) != "pstn":
+        return False
+    from_number = getattr(info, "from_number", None)
+    if not from_number:
+        return False
+    try:
+        guava.Client().send_sms(
+            from_number=config.GUAVA_AGENT_NUMBER,
+            to_number=from_number,
+            message=f"Mercury Insurance (demo): your claim number is {claim_number}. This is a demo text, not a real claim.",
+        )
+        return True
+    except Exception:
+        logger.exception("send_sms failed for claim %s", claim_number)
+        return False
+
+
+def _sms_confirmation_note(call: guava.Call, claim_number: str) -> str:
+    if _maybe_send_sms_confirmation(call, claim_number):
+        return " You've also been sent a text message confirming the claim number."
+    return ""
+
+
 def _finish_claim(call: guava.Call, claim_number: str) -> None:
     set_outcome(call, "claim_created")
     policyholder = call.get_variable("fnol_policyholder_name")
+    sms_note = _sms_confirmation_note(call, claim_number)
     call.hangup(
         final_instructions=(
             f"Let {policyholder} know their claim has been filed successfully. Their claim number "
-            f"is {claim_number}. A representative will follow up -- do not give a specific timeline "
-            f"or promise a callback window. Thank them for calling, and politely say goodbye."
+            f"is {claim_number}.{sms_note} A representative will follow up -- do not give a "
+            f"specific timeline or promise a callback window. Thank them for calling, and politely "
+            f"say goodbye."
         )
     )
 
@@ -493,22 +542,25 @@ def _on_tow_offer_complete(call: guava.Call) -> None:
     match result:
         case Ok(value):
             set_outcome(call, "claim_created")
+            sms_note = _sms_confirmation_note(call, claim_number)
             call.hangup(
                 final_instructions=(
                     f"Let {policyholder} know their claim number is {claim_number}, and that you've "
                     f"requested a tow -- {value.provider_name} is expected in approximately "
-                    f"{value.eta_minutes} minutes. Make clear the ETA is approximate. A representative "
-                    f"will follow up on the claim. Thank them and politely say goodbye."
+                    f"{value.eta_minutes} minutes. Make clear the ETA is approximate.{sms_note} A "
+                    f"representative will follow up on the claim. Thank them and politely say "
+                    f"goodbye."
                 )
             )
         case _:
             set_outcome(call, "claim_created", transfer_reason="tow_request_failed")
+            sms_note = _sms_confirmation_note(call, claim_number)
             call.hangup(
                 final_instructions=(
                     f"Let {policyholder} know their claim number is {claim_number}. Let them know the "
                     f"tow could not be requested right now due to a system issue, and that a "
                     f"representative will follow up and can help arrange one. Do NOT say a tow has "
-                    f"been requested. Thank them and politely say goodbye."
+                    f"been requested.{sms_note} Thank them and politely say goodbye."
                 )
             )
 
