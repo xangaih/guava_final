@@ -10,11 +10,30 @@ tow dispatched right now for a non-accident breakdown, transfers to the
 roadside line (H11) -- real dispatch is out of scope.
 """
 
+from guava.helpers.llm import IntentRecognizer
+
 import guava
 
 from . import config, copy, faq
 from .agent import FlowHandlers, needs_handoff, register_flow, set_outcome, transfer_to_human
 from .agent import agent as _agent
+
+# Confirmed live (2026-10-05): this flow never registered a
+# classify_intent, so "can I talk to a live representative?" had no
+# path to the shared transfer_to_human action at all -- the model had
+# no actual transfer capability available to it and falsely claimed no
+# representatives were available. fnol_flow and status_flow both had
+# this wired up from the start; this flow was simply missed.
+_intent = IntentRecognizer(
+    {
+        "transfer_to_human": (
+            "The caller explicitly asks to speak to a human, a representative, or a supervisor. "
+            "This does NOT include the caller asking general towing/roadside questions, or "
+            "asking about towing distances, costs, or what's covered -- those are normal parts "
+            "of this call, not a request for a human."
+        )
+    }
+)
 
 _PERSONAL_COVERAGE_KEYWORDS = (
     "my policy",
@@ -54,9 +73,8 @@ def start(call: guava.Call) -> None:
         ),
         checklist=[
             guava.Say(
-                "I can help with general questions about towing and roadside assistance. If "
-                "you've been in an accident, let me know and I'll get that started as a claim "
-                "instead."
+                "Sure -- what's your question about towing or roadside assistance? If you've "
+                "been in an accident, let me know and I'll get that started as a claim instead."
             ),
             guava.Field(
                 key="tow_needs_dispatch",
@@ -112,11 +130,16 @@ def build_session_summary(call: guava.Call, event) -> dict:
     return {"needed_dispatch": call.get_field("tow_needs_dispatch")}
 
 
+def classify_intent(intent_summary: str):
+    return _intent.classify(intent_summary)
+
+
 register_flow(
     "tow",
     FlowHandlers(
         start=start,
         handle_question=handle_question,
+        classify_intent=classify_intent,
         build_session_summary=build_session_summary,
     ),
 )

@@ -31,58 +31,56 @@ TRANSFER_BACKEND_DOWN = (
 # not guaranteed word-for-word.
 
 
-def status_received(adjuster_name: str | None, adjuster_phone: str | None) -> str:
+def _representative_clause(adjuster_name: str | None, adjuster_phone: str | None) -> str | None:
+    # Confirmed live (2026-10-05): a hand-edited claim had adjuster_name
+    # set but adjuster_phone still null. The model happened to drop the
+    # phone number gracefully that one time rather than literally saying
+    # "reachable at None," but that's model luck, not something this
+    # code should rely on -- only mention a phone number that's actually
+    # on file, independent of whether a name is.
+    if adjuster_name and adjuster_phone:
+        return f"{adjuster_name}, reachable at {adjuster_phone}"
     if adjuster_name:
-        return (
-            f"Let the caller know their claim was received and is in our system. Their assigned "
-            f"representative is {adjuster_name}, reachable at {adjuster_phone}. Thank them and "
-            f"politely say goodbye."
-        )
-    return (
-        "Let the caller know their claim was received and is in our system. No representative has "
-        "been assigned yet. Thank them and politely say goodbye."
-    )
+        return adjuster_name
+    return None
+
+
+def status_received(adjuster_name: str | None, adjuster_phone: str | None) -> str:
+    rep = _representative_clause(adjuster_name, adjuster_phone)
+    base = "Let the caller know their claim was received and is in our system."
+    base += f" Their assigned representative is {rep}." if rep else " No representative has been assigned yet."
+    base += " Thank them and politely say goodbye."
+    return base
 
 
 def status_under_review(adjuster_name: str | None, adjuster_phone: str | None) -> str:
-    if adjuster_name:
-        return (
-            f"Let the caller know their claim is currently under review. Their assigned "
-            f"representative, {adjuster_name} ({adjuster_phone}), can answer further questions. "
-            f"Thank them and politely say goodbye."
-        )
-    return (
-        "Let the caller know their claim is currently under review. No representative has been "
-        "assigned yet. Thank them and politely say goodbye."
-    )
+    rep = _representative_clause(adjuster_name, adjuster_phone)
+    base = "Let the caller know their claim is currently under review."
+    base += f" Their assigned representative, {rep}, can answer further questions." if rep else " No representative has been assigned yet."
+    base += " Thank them and politely say goodbye."
+    return base
 
 
 def status_awaiting_documents(adjuster_name: str | None, adjuster_phone: str | None) -> str:
+    rep = _representative_clause(adjuster_name, adjuster_phone)
     base = "Let the caller know additional documents are needed for their claim."
-    if adjuster_name:
-        base += f" Their representative, {adjuster_name} ({adjuster_phone}), can say which ones."
-    else:
-        base += " A representative will reach out with specifics."
+    base += f" Their representative, {rep}, can say which ones." if rep else " A representative will reach out with specifics."
     base += " Do not guess which documents are needed. Thank them and politely say goodbye."
     return base
 
 
 def status_approved(adjuster_name: str | None, adjuster_phone: str | None) -> str:
+    rep = _representative_clause(adjuster_name, adjuster_phone)
     base = "Let the caller know their claim has been approved."
-    if adjuster_name:
-        base += f" Their representative, {adjuster_name} ({adjuster_phone}), will go over payment details."
-    else:
-        base += " A representative will follow up to go over payment details."
+    base += f" Their representative, {rep}, will go over payment details." if rep else " A representative will follow up to go over payment details."
     base += " Do not state or estimate any dollar amount. Thank them and politely say goodbye."
     return base
 
 
 def status_closed(adjuster_name: str | None, adjuster_phone: str | None) -> str:
+    rep = _representative_clause(adjuster_name, adjuster_phone)
     base = "Let the caller know their claim is closed."
-    if adjuster_name:
-        base += f" For further questions, their representative is {adjuster_name} ({adjuster_phone})."
-    else:
-        base += " A representative is available if they have further questions."
+    base += f" For further questions, their representative is {rep}." if rep else " A representative is available if they have further questions."
     base += " Thank them and politely say goodbye."
     return base
 

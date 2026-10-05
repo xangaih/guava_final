@@ -52,11 +52,20 @@ def test_route_something_else_transfers_to_human():
 
 
 def test_route_dispatches_to_registered_flow():
+    # Save/restore rather than unconditionally popping "fnol": pytest
+    # collects every test file before running any test, so the real
+    # fnol_flow module (and its real registration) may already be
+    # present here regardless of file run order. An earlier version of
+    # this test popped "fnol" unconditionally in its cleanup, which
+    # silently deleted the real registration for every test that ran
+    # after it in the same session -- exactly the kind of bug that let
+    # tow_flow's missing classify_intent go unnoticed.
     started = {}
 
     def fake_start(call):
         started["called"] = True
 
+    previous = agent_module._flows.get("fnol")
     agent_module.register_flow("fnol", agent_module.FlowHandlers(start=fake_start))
     try:
         call = _call()
@@ -65,7 +74,10 @@ def test_route_dispatches_to_registered_flow():
         assert started.get("called") is True
         assert call.get_variable("flow") == "fnol"
     finally:
-        agent_module._flows.pop("fnol", None)
+        if previous is not None:
+            agent_module._flows["fnol"] = previous
+        else:
+            agent_module._flows.pop("fnol", None)
 
 
 def test_on_question_falls_back_when_no_flow_registered():
@@ -75,16 +87,20 @@ def test_on_question_falls_back_when_no_flow_registered():
 
 
 def test_on_question_dispatches_to_registered_flow():
+    # Uses a flow name that can never collide with a real one (unlike
+    # the old version of this test, which used "fnol" and then popped
+    # it unconditionally in cleanup -- silently deleting the real
+    # registration for every test that ran after it).
     agent_module.register_flow(
-        "fnol",
+        "_test_fake_flow",
         agent_module.FlowHandlers(start=lambda call: None, handle_question=lambda call, q: f"echo: {q}"),
     )
     try:
         call = _call()
-        call.set_variable("flow", "fnol")
+        call.set_variable("flow", "_test_fake_flow")
         assert agent_module.on_question(call, "huh?") == "echo: huh?"
     finally:
-        agent_module._flows.pop("fnol", None)
+        agent_module._flows.pop("_test_fake_flow", None)
 
 
 def test_on_action_request_falls_back_to_none_when_no_flow_registered():
@@ -127,3 +143,18 @@ def test_as_datetime_dict_payload_defaults_missing_time_components_to_zero():
 def test_as_datetime_still_handles_iso_string_and_datetime_object():
     assert agent_module.as_datetime("2026-10-01T12:30:00") == datetime(2026, 10, 1, 12, 30, 0)
     assert agent_module.as_datetime(datetime(2026, 10, 1, 12, 30)) == datetime(2026, 10, 1, 12, 30)
+
+
+def test_every_flow_registers_a_classify_intent():
+    # Regression test for a live bug (2026-10-05): tow_flow never
+    # registered classify_intent, so "can I talk to a live
+    # representative?" had no path to transfer_to_human at all -- the
+    # model had no real transfer capability and falsely claimed none
+    # were available. Importing all three here (rather than relying on
+    # whichever test file pytest happens to import first) guarantees
+    # every registered flow is checked, regardless of collection order.
+    from mercury_claims import fnol_flow, status_flow, tow_flow  # noqa: F401
+
+    for name in ("fnol", "status", "tow"):
+        handlers = agent_module._flows[name]
+        assert handlers.classify_intent is not None, f"{name} has no classify_intent registered"
