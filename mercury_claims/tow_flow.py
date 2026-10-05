@@ -24,6 +24,9 @@ from .agent import agent as _agent
 # no actual transfer capability available to it and falsely claimed no
 # representatives were available. fnol_flow and status_flow both had
 # this wired up from the start; this flow was simply missed.
+# Confirmed live (2026-10-05, same call): a caller who said "I wanna
+# file a claim" mid-call also had no path anywhere -- switch_to_fnol/
+# switch_to_status (agent.py) are the fix.
 _intent = IntentRecognizer(
     {
         "transfer_to_human": (
@@ -31,7 +34,16 @@ _intent = IntentRecognizer(
             "This does NOT include the caller asking general towing/roadside questions, or "
             "asking about towing distances, costs, or what's covered -- those are normal parts "
             "of this call, not a request for a human."
-        )
+        ),
+        "switch_to_fnol": (
+            "The caller says they actually want to report a new claim instead of asking a "
+            "general towing/roadside question -- a change of mind about why they're calling."
+        ),
+        "switch_to_status": (
+            "The caller says they actually want to check the status of an existing claim instead "
+            "of asking a general towing/roadside question -- a change of mind about why they're "
+            "calling."
+        ),
     }
 )
 

@@ -158,3 +158,42 @@ def test_every_flow_registers_a_classify_intent():
     for name in ("fnol", "status", "tow"):
         handlers = agent_module._flows[name]
         assert handlers.classify_intent is not None, f"{name} has no classify_intent registered"
+
+
+def test_switch_flow_sets_the_flow_variable_and_calls_start(monkeypatch):
+    started = {}
+    fake_handlers = agent_module.FlowHandlers(start=lambda call: started.update(called=True))
+    monkeypatch.setitem(agent_module._flows, "fnol", fake_handlers)
+
+    call = _call()
+    agent_module.switch_flow(call, "fnol")
+
+    assert call.get_variable("flow") == "fnol"
+    assert started.get("called") is True
+
+
+def test_switch_flow_clears_a_stale_handoff_reason():
+    # Regression test for a live bug (2026-10-05): without this, a
+    # caller who got 3 strikes on a validator in the OLD flow would
+    # immediately get transferred again in the NEW flow, for a reason
+    # that happened before they even switched.
+    call = _call()
+    call.set_variable("handoff_reason", "validation_exhausted")
+    agent_module.register_flow("_test_switch_target", agent_module.FlowHandlers(start=lambda call: None))
+    try:
+        agent_module.switch_flow(call, "_test_switch_target")
+        assert agent_module.needs_handoff(call) is False
+    finally:
+        agent_module._flows.pop("_test_switch_target", None)
+
+
+def test_switch_to_fnol_status_tow_actions_target_the_right_flow(monkeypatch):
+    calls = []
+    monkeypatch.setattr(agent_module, "switch_flow", lambda call, name: calls.append(name))
+    call = _call()
+
+    agent_module.on_switch_to_fnol(call)
+    agent_module.on_switch_to_status(call)
+    agent_module.on_switch_to_tow(call)
+
+    assert calls == ["fnol", "status", "tow"]

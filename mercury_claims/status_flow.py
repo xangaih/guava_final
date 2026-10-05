@@ -40,7 +40,16 @@ _intent = IntentRecognizer(
             "are normal parts of checking a claim, not a request for a human. (Confirmed live: "
             "fnol_flow's broader version of this intent over-triggered on a benign claim question; "
             "keeping this one narrow defensively.)"
-        )
+        ),
+        "switch_to_fnol": (
+            "The caller says they actually want to report a new claim instead of checking the "
+            "status of an existing one -- a change of mind about why they're calling."
+        ),
+        "switch_to_tow": (
+            "The caller says they actually want to ask a general towing or roadside assistance "
+            "question instead of checking a claim's status -- a change of mind about why they're "
+            "calling."
+        ),
     }
 )
 

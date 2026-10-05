@@ -1,6 +1,6 @@
 --- originals/fnol/__main__.py	2026-10-05 09:47:18
-+++ mercury_claims/fnol_flow.py	2026-10-05 13:11:47
-@@ -1,187 +1,302 @@
++++ mercury_claims/fnol_flow.py	2026-10-05 15:01:31
+@@ -1,187 +1,318 @@
 -# SDK conformance: guava-sdk 0.44.0 (2026-09-15)
 -import argparse
 -import json
@@ -49,6 +49,12 @@
 -ADJUSTER_LINE = "+15551000300"
 +logger = logging.getLogger("mercury_claims.fnol_flow")
  
++# Confirmed live (2026-10-05): a caller who changes their mind mid-call
++# about *what kind* of help they want (not just "give me a human") had
++# no path anywhere in the codebase -- the model stalled with filler
++# until the caller hung up. switch_to_status/switch_to_tow (agent.py)
++# are the fix; they need to be offered here too, not just the shared
++# transfer_to_human.
 +_intent = IntentRecognizer(
 +    {
 +        "transfer_to_human": (
@@ -60,6 +66,16 @@
 +            "does NOT include the caller asking what information is still needed, asking about "
 +            "their own claim or vehicle details, or asking general questions about the process -- "
 +            "those are normal parts of filing a claim, not a request for a human."
++        ),
++        "switch_to_status": (
++            "The caller says they actually want to check the status of an existing claim instead "
++            "of reporting a new one -- a change of mind about why they're calling, not a question "
++            "about this claim."
++        ),
++        "switch_to_tow": (
++            "The caller says they actually want to ask a general towing or roadside assistance "
++            "question instead of reporting a new claim -- a change of mind about why they're "
++            "calling, not a question about this claim."
 +        ),
 +    }
 +)
@@ -438,7 +454,7 @@
                  choices=["yes", "no"],
                  required=True,
              ),
-@@ -189,286 +304,303 @@
+@@ -189,286 +320,303 @@
      )
  
  
@@ -494,6 +510,8 @@
 -                f"Let them know that because injuries are involved, you need to connect them "
 -                f"with a licensed adjuster who can guide them through the next steps. "
 -                f"Reassure them that their information so far has been saved."
+-            ),
+-        )
 +@_agent.on_task_complete("fnol_vehicle")
 +def _on_vehicle_complete(call: guava.Call) -> None:
 +    if needs_handoff(call):
@@ -510,8 +528,7 @@
 +                field_type="multiple_choice",
 +                choices=["yes", "no", "not sure"],
 +                required=True,
-             ),
--        )
++            ),
 +            guava.Field(key="fnol_police_report_number", description="The police report number, if known", field_type="text", required=False),
 +            guava.Field(key="fnol_police_department", description="The police department that responded, if known", field_type="text", required=False),
 +        ],
@@ -733,6 +750,10 @@
 +        details=details,
      )
  
+-
+-@agent.on_task_complete("collect_auto_details")
+-def on_auto_details(call: guava.Call) -> None:
+-    _finalize_claim(call)
 +    match result:
 +        case Ok(value):
 +            call.set_variable("fnol_claim_number", value.claim_number)
@@ -777,10 +798,10 @@
 +                ),
 +            )
  
--@agent.on_task_complete("collect_auto_details")
--def on_auto_details(call: guava.Call) -> None:
--    _finalize_claim(call)
  
+-@agent.on_task_complete("collect_property_details")
+-def on_property_details(call: guava.Call) -> None:
+-    _finalize_claim(call)
 +# --- C15 (stretch): SMS confirmation of the claim number ---
 +#
 +# Off by default (SMS_CONFIRMATION_ENABLED). Only say "you've been
@@ -791,9 +812,6 @@
 +# (drivable=yes finish, and both tow-offer outcomes) -- not the
 +# injury-partial-claim path, which ends in a transfer, not a goodbye.
  
--@agent.on_task_complete("collect_property_details")
--def on_property_details(call: guava.Call) -> None:
--    _finalize_claim(call)
 +def _maybe_send_sms_confirmation(call: guava.Call, claim_number: str) -> bool:
 +    if not config.SMS_CONFIRMATION_ENABLED:
 +        return False
@@ -814,15 +832,14 @@
 +        logger.exception("send_sms failed for claim %s", claim_number)
 +        return False
  
- 
 -@agent.on_task_complete("collect_general_details")
 -def on_general_details(call: guava.Call) -> None:
 -    _finalize_claim(call)
+ 
 +def _sms_confirmation_note(call: guava.Call, claim_number: str) -> str:
 +    if _maybe_send_sms_confirmation(call, claim_number):
 +        return " You've also been sent a text message confirming the claim number."
 +    return ""
- 
  
 -@agent.on_question
 -def on_question(call: guava.Call, question: str) -> str:
@@ -831,6 +848,7 @@
 -        "That will be handled by your assigned adjuster, who will review all the "
 -        "details of your case. For now, let's make sure we capture everything you "
 -        "need to report."
++
 +def _finish_claim(call: guava.Call, claim_number: str) -> None:
 +    set_outcome(call, "claim_created")
 +    policyholder = call.get_variable("fnol_policyholder_name")

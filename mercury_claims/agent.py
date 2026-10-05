@@ -268,8 +268,7 @@ def on_route_complete(call: guava.Call) -> None:
         transfer_to_human(call)
         return
 
-    call.set_variable("flow", flow_name)
-    handlers.start(call)
+    switch_flow(call, flow_name)
 
 
 @agent.on_question
@@ -295,6 +294,42 @@ def on_transfer_to_human(call: guava.Call) -> None:
     # action key avoids every flow registering its own near-duplicate.
     set_outcome(call, "transferred", transfer_reason="mid_call_intent")
     transfer_to_human(call)
+
+
+# --- Mid-call flow switching ---
+#
+# Confirmed live (2026-10-05): a caller mid-call in tow_flow said "I
+# wanna file a claim" -- there was no mechanism anywhere to recognize or
+# act on wanting a *different* top-level purpose (only "wants a human"
+# was ever wired up), so the model had nothing it could do and stalled
+# with filler until the caller hung up. A SuggestedAction is just
+# {key, description} with no parameter slot, so the target flow has to
+# be encoded in the action key itself -- one shared action per
+# destination, same pattern as transfer_to_human.
+
+def switch_flow(call: guava.Call, flow_name: str) -> None:
+    # Clear any stale handoff flag from the old flow -- otherwise the
+    # new flow's very first task-completion would see needs_handoff()
+    # still True (from 3 failed validator attempts, say) and immediately
+    # transfer for no reason the caller would understand.
+    call.set_variable("handoff_reason", None)
+    call.set_variable("flow", flow_name)
+    _flows[flow_name].start(call)
+
+
+@agent.on_action("switch_to_fnol")
+def on_switch_to_fnol(call: guava.Call) -> None:
+    switch_flow(call, "fnol")
+
+
+@agent.on_action("switch_to_status")
+def on_switch_to_status(call: guava.Call) -> None:
+    switch_flow(call, "status")
+
+
+@agent.on_action("switch_to_tow")
+def on_switch_to_tow(call: guava.Call) -> None:
+    switch_flow(call, "tow")
 
 
 @agent.on_session_end

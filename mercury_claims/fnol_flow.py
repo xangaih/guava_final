@@ -37,6 +37,12 @@ from .models import Malformed, NotFound, Ok, Unavailable
 
 logger = logging.getLogger("mercury_claims.fnol_flow")
 
+# Confirmed live (2026-10-05): a caller who changes their mind mid-call
+# about *what kind* of help they want (not just "give me a human") had
+# no path anywhere in the codebase -- the model stalled with filler
+# until the caller hung up. switch_to_status/switch_to_tow (agent.py)
+# are the fix; they need to be offered here too, not just the shared
+# transfer_to_human.
 _intent = IntentRecognizer(
     {
         "transfer_to_human": (
@@ -48,6 +54,16 @@ _intent = IntentRecognizer(
             "does NOT include the caller asking what information is still needed, asking about "
             "their own claim or vehicle details, or asking general questions about the process -- "
             "those are normal parts of filing a claim, not a request for a human."
+        ),
+        "switch_to_status": (
+            "The caller says they actually want to check the status of an existing claim instead "
+            "of reporting a new one -- a change of mind about why they're calling, not a question "
+            "about this claim."
+        ),
+        "switch_to_tow": (
+            "The caller says they actually want to ask a general towing or roadside assistance "
+            "question instead of reporting a new claim -- a change of mind about why they're "
+            "calling, not a question about this claim."
         ),
     }
 )
