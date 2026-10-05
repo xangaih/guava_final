@@ -1,6 +1,6 @@
 --- originals/claims_status/__main__.py	2026-10-05 09:47:18
-+++ mercury_claims/status_flow.py	2026-10-05 15:01:40
-@@ -1,358 +1,253 @@
++++ mercury_claims/status_flow.py	2026-10-05 15:19:03
+@@ -1,358 +1,257 @@
 -# SDK conformance: guava-sdk 0.44.0 (2026-09-15)
 -import argparse
 -import json
@@ -79,8 +79,11 @@
 -            "The claim is currently under review. We are waiting on the inspection "
 -            "report from the field adjuster, which is expected within 3 business days."
 +        "switch_to_fnol": (
-+            "The caller says they actually want to report a new claim instead of checking the "
-+            "status of an existing one -- a change of mind about why they're calling."
++            "The caller explicitly states they were just in an accident, their car was just hit, "
++            "or they need to report a brand new incident right now, separate from the claim they "
++            "called to check on. This does NOT include asking for more general information, "
++            "details, or explanations about the claim being checked -- that's a normal part of "
++            "the status check."
          ),
 -        "adjuster": "Property Claims Team",
 -        "adjuster_number": "+15551000201",
@@ -96,9 +99,10 @@
 -            "coverage period. The policyholder has the right to file an appeal within "
 -            "60 days of the denial notice."
 +        "switch_to_tow": (
-+            "The caller says they actually want to ask a general towing or roadside assistance "
-+            "question instead of checking a claim's status -- a change of mind about why they're "
-+            "calling."
++            "The caller explicitly states they want general towing or roadside assistance "
++            "information and have stopped wanting to continue checking this claim. This does NOT "
++            "include asking for more general information, details, or explanations about the "
++            "claim being checked -- that's a normal part of the status check."
          ),
 -        "adjuster": "Appeals Department",
 -        "adjuster_number": "+15551000202",

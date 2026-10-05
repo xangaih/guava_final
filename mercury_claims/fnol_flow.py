@@ -56,14 +56,16 @@ _intent = IntentRecognizer(
             "those are normal parts of filing a claim, not a request for a human."
         ),
         "switch_to_status": (
-            "The caller says they actually want to check the status of an existing claim instead "
-            "of reporting a new one -- a change of mind about why they're calling, not a question "
-            "about this claim."
+            "The caller explicitly states they want to check on a DIFFERENT, already-existing "
+            "claim, not the new incident currently being reported. This does NOT include asking "
+            "for more general information, details, or explanations about the incident being "
+            "reported -- that's a normal part of filing it."
         ),
         "switch_to_tow": (
-            "The caller says they actually want to ask a general towing or roadside assistance "
-            "question instead of reporting a new claim -- a change of mind about why they're "
-            "calling, not a question about this claim."
+            "The caller explicitly states they want general towing or roadside assistance "
+            "information and have stopped wanting to continue reporting this incident. This does "
+            "NOT include asking for more general information, details, or explanations about the "
+            "incident being reported -- that's a normal part of filing it."
         ),
     }
 )

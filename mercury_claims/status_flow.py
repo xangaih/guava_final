@@ -42,13 +42,17 @@ _intent = IntentRecognizer(
             "keeping this one narrow defensively.)"
         ),
         "switch_to_fnol": (
-            "The caller says they actually want to report a new claim instead of checking the "
-            "status of an existing one -- a change of mind about why they're calling."
+            "The caller explicitly states they were just in an accident, their car was just hit, "
+            "or they need to report a brand new incident right now, separate from the claim they "
+            "called to check on. This does NOT include asking for more general information, "
+            "details, or explanations about the claim being checked -- that's a normal part of "
+            "the status check."
         ),
         "switch_to_tow": (
-            "The caller says they actually want to ask a general towing or roadside assistance "
-            "question instead of checking a claim's status -- a change of mind about why they're "
-            "calling."
+            "The caller explicitly states they want general towing or roadside assistance "
+            "information and have stopped wanting to continue checking this claim. This does NOT "
+            "include asking for more general information, details, or explanations about the "
+            "claim being checked -- that's a normal part of the status check."
         ),
     }
 )

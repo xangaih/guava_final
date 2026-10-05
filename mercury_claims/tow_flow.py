@@ -27,6 +27,15 @@ from .agent import agent as _agent
 # Confirmed live (2026-10-05, same call): a caller who said "I wanna
 # file a claim" mid-call also had no path anywhere -- switch_to_fnol/
 # switch_to_status (agent.py) are the fix.
+#
+# Confirmed live (2026-10-05, later test): switch_to_fnol initially
+# misfired on an elaborate towing/plan-tier FAQ follow-up question --
+# its own description restated "towing/roadside question" right next
+# to a caller utterance that was itself heavily about towing, which may
+# have invited keyword-overlap confusion. Reworded below to lead with a
+# sharp, vivid positive trigger (an actual new incident) and phrase the
+# exclusion abstractly ("more general information") instead of
+# repeating topic keywords.
 _intent = IntentRecognizer(
     {
         "transfer_to_human": (
@@ -36,13 +45,16 @@ _intent = IntentRecognizer(
             "of this call, not a request for a human."
         ),
         "switch_to_fnol": (
-            "The caller says they actually want to report a new claim instead of asking a "
-            "general towing/roadside question -- a change of mind about why they're calling."
+            "The caller explicitly states they were just in an accident, their car was just hit, "
+            "or they need to report a brand new incident right now. This does NOT include asking "
+            "for more general information, details, or explanations about anything already being "
+            "discussed -- that's a normal follow-up question, not a new incident."
         ),
         "switch_to_status": (
-            "The caller says they actually want to check the status of an existing claim instead "
-            "of asking a general towing/roadside question -- a change of mind about why they're "
-            "calling."
+            "The caller explicitly states they want to check on an existing claim they already "
+            "filed. This does NOT include asking for more general information, details, or "
+            "explanations about anything already being discussed -- that's a normal follow-up "
+            "question, not a request to check a claim."
         ),
     }
 )
