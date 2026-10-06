@@ -1,0 +1,10 @@
+-- Intentionally a no-op.
+--
+-- The remote database's migration history records a migration with this
+-- exact version and name (it was applied directly to the live project to
+-- pin set_updated_at()'s search_path, per Supabase's security advisor).
+-- Its content was then folded into 20261005171500_init.sql locally, but
+-- the history entry remained, so Supabase's GitHub check failed with
+-- "remote migration versions not found in local migrations directory".
+-- This file exists only so the local directory matches the remote
+-- history exactly. The change itself is already in the init migration.

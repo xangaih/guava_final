@@ -21,14 +21,14 @@ TRANSFER_BACKEND_DOWN = (
     "representative."
 )
 
-# Section 8.3's words-per-status table. Delivered via call.hangup's
-# final_instructions (an instruction to the model), not a literal
-# guava.Say: whether a Say-only task (no Field items) completes cleanly
-# is unverified against a live call (the plan itself flags this as a
-# thing to verify), and verifying it needs a live call, which isn't being
-# done right now. This is the plan's own documented fallback for exactly
-# that gap. Noted in the README: status wording is close to verbatim,
-# not guaranteed word-for-word.
+# Section 8.3's words-per-status table. Delivered as the objective of the
+# shared wrap-up task (agent.end_call_with_wrapup) -- an instruction to
+# the model, not a literal guava.Say -- so the status is spoken and then
+# the caller is asked whether there's anything else. The goodbye itself
+# is deliberately NOT part of these strings any more: it's said only once
+# the caller answers "no" to that question (agent._on_wrap_up_complete).
+# Noted in the README: status wording is close to verbatim, not
+# guaranteed word-for-word.
 
 
 def _representative_clause(adjuster_name: str | None, adjuster_phone: str | None) -> str | None:
@@ -49,7 +49,6 @@ def status_received(adjuster_name: str | None, adjuster_phone: str | None) -> st
     rep = _representative_clause(adjuster_name, adjuster_phone)
     base = "Let the caller know their claim was received and is in our system."
     base += f" Their assigned representative is {rep}." if rep else " No representative has been assigned yet."
-    base += " Thank them and politely say goodbye."
     return base
 
 
@@ -57,7 +56,6 @@ def status_under_review(adjuster_name: str | None, adjuster_phone: str | None) -
     rep = _representative_clause(adjuster_name, adjuster_phone)
     base = "Let the caller know their claim is currently under review."
     base += f" Their assigned representative, {rep}, can answer further questions." if rep else " No representative has been assigned yet."
-    base += " Thank them and politely say goodbye."
     return base
 
 
@@ -65,7 +63,7 @@ def status_awaiting_documents(adjuster_name: str | None, adjuster_phone: str | N
     rep = _representative_clause(adjuster_name, adjuster_phone)
     base = "Let the caller know additional documents are needed for their claim."
     base += f" Their representative, {rep}, can say which ones." if rep else " A representative will reach out with specifics."
-    base += " Do not guess which documents are needed. Thank them and politely say goodbye."
+    base += " Do not guess which documents are needed."
     return base
 
 
@@ -73,7 +71,7 @@ def status_approved(adjuster_name: str | None, adjuster_phone: str | None) -> st
     rep = _representative_clause(adjuster_name, adjuster_phone)
     base = "Let the caller know their claim has been approved."
     base += f" Their representative, {rep}, will go over payment details." if rep else " A representative will follow up to go over payment details."
-    base += " Do not state or estimate any dollar amount. Thank them and politely say goodbye."
+    base += " Do not state or estimate any dollar amount."
     return base
 
 
@@ -81,7 +79,6 @@ def status_closed(adjuster_name: str | None, adjuster_phone: str | None) -> str:
     rep = _representative_clause(adjuster_name, adjuster_phone)
     base = "Let the caller know their claim is closed."
     base += f" For further questions, their representative is {rep}." if rep else " A representative is available if they have further questions."
-    base += " Thank them and politely say goodbye."
     return base
 
 
@@ -123,6 +120,22 @@ INTAKE_QUESTION_ACKNOWLEDGMENT = (
 STATUS_CLAIM_DETAIL_DEFLECTION = (
     "I'm not able to share additional details beyond your claim's current status -- your "
     "assigned representative can go over the specifics with you."
+)
+
+# Both desks: "how many claims do I have?" / "my claim history". There is
+# deliberately no list-or-count lookup anywhere (it would be enumeration),
+# so the honest answer is the limitation itself. Confirmed live
+# (2026-10-06): without this the model said "let me check your claim
+# history" -- an action it cannot take -- before transferring generically.
+CLAIM_HISTORY_DEFLECTION = (
+    "I can only look up one claim at a time, by its claim number, so I'm not able to list or "
+    "count your claims. A representative can review your full claim history -- would you like "
+    "me to connect you?"
+)
+
+TRANSFER_CLAIM_HISTORY = (
+    "Let the caller know you can only look up one claim at a time by its claim number, and "
+    "that you're connecting them with a representative who can review their full claim history."
 )
 
 # status_flow: a question that's clearly about something else entirely

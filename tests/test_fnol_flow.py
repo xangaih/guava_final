@@ -6,7 +6,7 @@ return canned typed Results, so these run with no server and no network
 already covered separately).
 """
 
-from datetime import datetime
+from datetime import date, datetime
 
 import pytest
 from guava.commands import SendInstructionCommand, SetTaskCommand, TransferCommand
@@ -41,6 +41,18 @@ def _tasks(call: MockCall) -> list[SetTaskCommand]:
     return [c for c in call._command_queue if isinstance(c, SetTaskCommand)]
 
 
+def _last_task_objective(call: MockCall) -> str:
+    # Success-path closings are no longer hangup() instructions: they're
+    # the objective of the shared wrap_up task (agent.end_call_with_wrapup).
+    return _tasks(call)[-1].objective
+
+
+def _confirm_vehicle(call: MockCall) -> None:
+    assert _tasks(call)[-1].task_id == "fnol_vehicle_confirm"
+    call.set_field("fnol_vehicle_confirmed", "yes")
+    fnol_flow._on_vehicle_confirm_complete(call)
+
+
 def test_s1_happy_path_drivable(monkeypatch):
     call = _call()
     _complete_identity_and_basics(call, monkeypatch, injuries="no")
@@ -49,6 +61,7 @@ def test_s1_happy_path_drivable(monkeypatch):
 
     call.set_field("fnol_drivable", "yes")
     fnol_flow._on_vehicle_complete(call)
+    _confirm_vehicle(call)
     assert _tasks(call)[-1].task_id == "fnol_police_report"
 
     call.set_field("fnol_police_report_filed", "no")
@@ -59,8 +72,11 @@ def test_s1_happy_path_drivable(monkeypatch):
     fnol_flow._on_other_party_complete(call)
 
     assert not _transfers(call)
-    assert any("CLM-0001000" in text for text in _instructions(call))
+    assert _tasks(call)[-1].task_id == "wrap_up"
+    assert "CLM-0001000" in _last_task_objective(call)
+    assert "anything else" in _last_task_objective(call).lower()
     assert call.get_variable("fnol_claim_number") == "CLM-0001000"
+    assert call.get_variable("call_claim_number") == "CLM-0001000"
     assert call.get_variable("call_outcome") == "claim_created"
 
 
@@ -89,6 +105,7 @@ def test_s3_backend_500_on_submit_never_says_filed(monkeypatch):
     _complete_identity_and_basics(call, monkeypatch, injuries="no")
     call.set_field("fnol_drivable", "yes")
     fnol_flow._on_vehicle_complete(call)
+    _confirm_vehicle(call)
     call.set_field("fnol_police_report_filed", "no")
     fnol_flow._on_police_report_complete(call)
 
@@ -108,6 +125,7 @@ def test_s5_malformed_response_treated_as_unavailable(monkeypatch):
     _complete_identity_and_basics(call, monkeypatch, injuries="no")
     call.set_field("fnol_drivable", "yes")
     fnol_flow._on_vehicle_complete(call)
+    _confirm_vehicle(call)
     call.set_field("fnol_police_report_filed", "no")
     fnol_flow._on_police_report_complete(call)
 
@@ -161,6 +179,7 @@ def test_s7_not_drivable_tow_requested_says_requested_not_arriving(monkeypatch):
     _complete_identity_and_basics(call, monkeypatch, injuries="no")
     call.set_field("fnol_drivable", "no")
     fnol_flow._on_vehicle_complete(call)
+    _confirm_vehicle(call)
     call.set_field("fnol_police_report_filed", "no")
     fnol_flow._on_police_report_complete(call)
 
@@ -174,7 +193,8 @@ def test_s7_not_drivable_tow_requested_says_requested_not_arriving(monkeypatch):
     )
     fnol_flow._on_tow_offer_complete(call)
 
-    text = " ".join(_instructions(call)).lower()
+    assert _tasks(call)[-1].task_id == "wrap_up"
+    text = _last_task_objective(call).lower()
     assert "requested" in text
     assert "arriving" not in text
 
@@ -184,6 +204,7 @@ def test_tow_decline_skips_tow_request(monkeypatch):
     _complete_identity_and_basics(call, monkeypatch, injuries="no")
     call.set_field("fnol_drivable", "no")
     fnol_flow._on_vehicle_complete(call)
+    _confirm_vehicle(call)
     call.set_field("fnol_police_report_filed", "no")
     fnol_flow._on_police_report_complete(call)
     monkeypatch.setattr(fnol_flow.client, "create_claim", lambda **k: Ok(ClaimCreated(claim_number="CLM-0001000")))
@@ -335,8 +356,7 @@ def test_finish_claim_mentions_a_text_only_when_sms_actually_sent(monkeypatch):
     call = _call()
     call.set_variable("fnol_policyholder_name", "Jordan Alvarez")
     fnol_flow._finish_claim(call, "CLM-0001000")
-    instructions = _instructions(call)
-    assert any("text message" in text.lower() for text in instructions)
+    assert "text message" in _last_task_objective(call).lower()
 
 
 def test_finish_claim_says_nothing_about_a_text_when_flag_is_off(monkeypatch):
@@ -344,8 +364,240 @@ def test_finish_claim_says_nothing_about_a_text_when_flag_is_off(monkeypatch):
     call = _call()
     call.set_variable("fnol_policyholder_name", "Jordan Alvarez")
     fnol_flow._finish_claim(call, "CLM-0001000")
-    instructions = _instructions(call)
-    assert not any("text message" in text.lower() for text in instructions)
+    assert "text message" not in _last_task_objective(call).lower()
+
+
+def test_finish_claim_never_promises_a_timeline_and_ends_with_anything_else(monkeypatch):
+    monkeypatch.setattr(fnol_flow.config, "SMS_CONFIRMATION_ENABLED", False)
+    call = _call()
+    call.set_variable("fnol_policyholder_name", "Jordan Alvarez")
+    fnol_flow._finish_claim(call, "CLM-0001000")
+    text = _last_task_objective(call).lower()
+    assert "do not give a specific timeline" in text
+    assert "preferred repair shop" in text
+    assert "anything else" in text
+    # The goodbye is said only after the caller answers "no" to that --
+    # never in the closing itself (otherwise the agent says goodbye and
+    # then asks a question).
+    assert "goodbye" not in text
+
+
+def _set_vehicle_fields(call: MockCall, **overrides) -> None:
+    fields = {
+        "fnol_vehicle_year": 2019,
+        "fnol_vehicle_make": "Nissan",
+        "fnol_vehicle_model": "Altima",
+        "fnol_vehicle_color": "gray",
+        "fnol_vehicle_plate": "MCP510",
+        "fnol_damage_description": "rear bumper crushed",
+        "fnol_vehicle_location": "Main St",
+        "fnol_drivable": "yes",
+    }
+    fields.update(overrides)
+    for key, value in fields.items():
+        call.set_field(key, value)
+
+
+def test_vehicle_read_back_is_built_from_the_stored_values():
+    # Confirmed live (2026-10-05): "Altima" was stored as "Ultima" and
+    # plate "MCP510" as "MCP". The read-back must come from what will
+    # actually be submitted, not from what the model remembers hearing.
+    call = _call()
+    _set_vehicle_fields(call, fnol_vehicle_plate_state="CA", fnol_property_damage="yes",
+                        fnol_property_damage_description="a mailbox")
+    fnol_flow._on_vehicle_complete(call)
+    task = _tasks(call)[-1]
+    assert task.task_id == "fnol_vehicle_confirm"
+    text = task.objective
+    assert "2019 gray Nissan Altima" in text
+    assert "MCP510, CA" in text
+    assert "rear bumper crushed" in text
+    assert "a mailbox" in text
+    assert "Main St" in text
+
+
+def test_vehicle_read_back_omits_optional_details_that_were_not_given():
+    call = _call()
+    _set_vehicle_fields(call)  # no plate state, no property damage
+    fnol_flow._on_vehicle_complete(call)
+    text = _tasks(call)[-1].objective
+    assert "plate MCP510." in text
+    assert "None" not in text
+    assert "other property" not in text
+
+
+def test_vehicle_confirm_no_re_asks_the_vehicle_task_once():
+    call = _call()
+    _set_vehicle_fields(call)
+    fnol_flow._on_vehicle_complete(call)
+    call.set_field("fnol_vehicle_confirmed", "no")
+    fnol_flow._on_vehicle_confirm_complete(call)
+    assert not _transfers(call)
+    assert _tasks(call)[-1].task_id == "fnol_vehicle"
+    # The re-ask collects the same fields as the first ask.
+    keys = [item.key for item in _tasks(call)[-1].action_items if hasattr(item, "key")]
+    assert "fnol_vehicle_plate" in keys and "fnol_property_damage" in keys
+
+
+def test_vehicle_confirm_no_twice_transfers_instead_of_looping():
+    call = _call()
+    _set_vehicle_fields(call)
+    fnol_flow._on_vehicle_complete(call)
+    call.set_field("fnol_vehicle_confirmed", "no")
+    fnol_flow._on_vehicle_confirm_complete(call)
+    fnol_flow._on_vehicle_confirm_complete(call)
+    transfers = _transfers(call)
+    assert len(transfers) == 1
+    assert "vehicle details" in transfers[0].transfer_message.lower()
+    assert call.get_variable("call_transfer_reason") == "vehicle_details_unconfirmed"
+
+
+def test_submitted_details_include_plate_state_and_property_damage(monkeypatch):
+    call = _call()
+    _complete_identity_and_basics(call, monkeypatch, injuries="no")
+    _set_vehicle_fields(call, fnol_vehicle_plate_state="CA", fnol_property_damage="yes",
+                        fnol_property_damage_description="a fence")
+    fnol_flow._on_vehicle_complete(call)
+    _confirm_vehicle(call)
+    call.set_field("fnol_police_report_filed", "no")
+    fnol_flow._on_police_report_complete(call)
+
+    captured = {}
+
+    def fake_create_claim(**kwargs):
+        captured.update(kwargs)
+        return Ok(ClaimCreated(claim_number="CLM-0001000"))
+
+    monkeypatch.setattr(fnol_flow.client, "create_claim", fake_create_claim)
+    fnol_flow._on_other_party_complete(call)
+    assert captured["details"]["vehicle"]["plate_state"] == "CA"
+    assert captured["details"]["property_damage"] == "yes"
+    assert captured["details"]["property_damage_description"] == "a fence"
+
+
+def test_start_resets_per_call_state_so_a_second_claim_in_one_call_is_not_a_duplicate():
+    # With "anything else?" a second incident can be reported in the same
+    # call. The idempotency key must not carry over, or the backend would
+    # treat the second claim as a replay of the first.
+    call = _call()
+    call.set_variable("fnol_idempotency_key", "key-from-first-claim")
+    call.set_variable("fnol_identity_attempts", 1)
+    call.set_variable("fnol_vehicle_confirm_attempts", 1)
+    fnol_flow.start(call)
+    assert call.get_variable("fnol_idempotency_key") is None
+    assert call.get_variable("fnol_identity_attempts") == 0
+    assert call.get_variable("fnol_vehicle_confirm_attempts") == 0
+    assert fnol_flow._get_or_create_idempotency_key(call) != "key-from-first-claim"
+
+
+def test_identity_retry_still_works_after_start_reset(monkeypatch):
+    # Regression test for a live crash (2026-10-06): start() reset the
+    # attempt counter to None, get_variable's default of 0 did not apply
+    # to an explicit None, and "None + 1" raised inside the handler. The
+    # model then stalled on filler for ~70s and hung up. The old tests
+    # never called start() before the handler, so they couldn't see it.
+    call = _call()
+    fnol_flow.start(call)
+    call.set_field("fnol_policy_number_digits", "100245")
+    call.set_field("fnol_dob", "1999-01-01")
+    monkeypatch.setattr(fnol_flow.client, "verify_policy", lambda *a, **k: NotFound())
+    fnol_flow._on_identity_complete(call)
+    assert call.get_variable("fnol_identity_attempts") == 1
+    assert not _transfers(call)  # retried, not crashed, not transferred
+
+
+def _field_keys(call: MockCall) -> list[str]:
+    return [item.key for item in _tasks(call)[-1].action_items if item.key.startswith("fnol_")]
+
+
+def test_fresh_call_asks_for_policy_number_and_dob():
+    call = _call()
+    fnol_flow.start(call)
+    assert _field_keys(call) == ["fnol_policy_number_digits", "fnol_dob"]
+
+
+def test_verified_dob_is_not_asked_again_at_this_desk():
+    call = _call()
+    call.set_variable("call_verified_dob", "1988-04-12")
+    fnol_flow.start(call)
+    assert _field_keys(call) == ["fnol_policy_number_digits"]
+    assert "do not ask for the date of birth again" in _tasks(call)[-1].objective
+
+
+def test_verification_uses_the_carried_dob_and_stores_it(monkeypatch):
+    call = _call()
+    call.set_variable("call_verified_dob", "1988-04-12")
+    fnol_flow.start(call)
+    call.set_field("fnol_policy_number_digits", "100245")  # no fnol_dob collected
+    seen = {}
+
+    def fake_verify(policy_number, dob):
+        seen.update(policy_number=policy_number, dob=dob)
+        return Ok(PolicyVerification(verified=True, holder_name="Jordan Alvarez", status="active"))
+
+    monkeypatch.setattr(fnol_flow.client, "verify_policy", fake_verify)
+    fnol_flow._on_identity_complete(call)
+    assert seen["dob"] == date(1988, 4, 12)
+    assert _tasks(call)[-1].task_id == "fnol_loss_basics"
+
+
+def test_fresh_verification_stores_the_dob_for_later_desks(monkeypatch):
+    call = _call()
+    _complete_identity(call, monkeypatch)
+    assert call.get_variable("call_verified_dob") == "1988-04-12"
+
+
+def test_mismatch_with_a_carried_dob_drops_it_and_asks_for_both(monkeypatch):
+    call = _call()
+    call.set_variable("call_verified_dob", "1988-04-12")
+    fnol_flow.start(call)
+    call.set_field("fnol_policy_number_digits", "999999")
+    monkeypatch.setattr(fnol_flow.client, "verify_policy", lambda *a, **k: Ok(PolicyVerification(verified=False)))
+    fnol_flow._on_identity_complete(call)
+
+    assert not _transfers(call)
+    assert call.get_variable("call_verified_dob") is None
+    assert _tasks(call)[-1].task_id == "fnol_identity"
+    assert "fnol_dob" in _field_keys(call)
+    assert call.get_variable("fnol_identity_attempts") == 1
+
+
+def test_handle_question_about_claim_history_states_the_limitation():
+    call = _call()
+    assert fnol_flow.handle_question(call, "How many claims do I have?") == fnol_flow.copy.CLAIM_HISTORY_DEFLECTION
+
+
+def test_vehicle_confirm_no_still_works_after_start_reset():
+    call = _call()
+    fnol_flow.start(call)
+    _set_vehicle_fields(call)
+    fnol_flow._on_vehicle_complete(call)
+    call.set_field("fnol_vehicle_confirmed", "no")
+    fnol_flow._on_vehicle_confirm_complete(call)
+    assert call.get_variable("fnol_vehicle_confirm_attempts") == 1
+    assert _tasks(call)[-1].task_id == "fnol_vehicle"
+
+
+def test_injury_partial_claim_records_the_claim_number_for_the_audit_row(monkeypatch):
+    call = _call()
+    _complete_identity(call, monkeypatch)
+    call.set_field("fnol_loss_type", "collision")
+    call.set_field("fnol_loss_at", datetime(2026, 10, 1, 12, 0, 0).isoformat())
+    call.set_field("fnol_loss_location", "Main St")
+    call.set_field("fnol_loss_description", "crash")
+    call.set_field("fnol_injuries", "yes")
+    monkeypatch.setattr(fnol_flow.client, "create_claim", lambda **k: Ok(ClaimCreated(claim_number="CLM-0001000")))
+    fnol_flow._on_loss_basics_complete(call)
+    assert call.get_variable("call_claim_number") == "CLM-0001000"
+
+
+def test_handle_question_deflects_cost_questions_during_intake():
+    # Confirmed live (2026-10-05): "how much do I have to pay?" fell
+    # through to the process-question ack. This flow has no FAQ, so any
+    # cost phrasing is a representative's question.
+    call = _call()
+    for question in ["How much do I have to pay for this?", "What's this going to cost me?", "Is there a charge for the tow?"]:
+        assert fnol_flow.handle_question(call, question) == fnol_flow.copy.COVERAGE_DEFLECTION
 
 
 def _complete_identity(call: MockCall, monkeypatch) -> None:

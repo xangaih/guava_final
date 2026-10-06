@@ -26,6 +26,8 @@ from .agent import (
     as_date,
     as_datetime,
     bounded_validate,
+    end_call_with_wrapup,
+    is_claim_history_question,
     needs_handoff,
     register_flow,
     set_outcome,
@@ -42,33 +44,42 @@ logger = logging.getLogger("mercury_claims.fnol_flow")
 # no path anywhere in the codebase -- the model stalled with filler
 # until the caller hung up. switch_to_status/switch_to_tow (agent.py)
 # are the fix; they need to be offered here too, not just the shared
-# transfer_to_human.
-_intent = IntentRecognizer(
-    {
-        "transfer_to_human": (
-            "The caller explicitly asks to speak to a human, a representative, or a supervisor; "
-            "disputes who was at fault; mentions a lawyer, attorney, lawsuit, or formal complaint; "
-            "or states that they are not the policyholder and are calling on someone else's behalf. "
-            "Also covers the caller wanting to enroll in a new policy, become a new customer, or "
-            "get an insurance quote -- this line only handles existing policies and claims. This "
-            "does NOT include the caller asking what information is still needed, asking about "
-            "their own claim or vehicle details, or asking general questions about the process -- "
-            "those are normal parts of filing a claim, not a request for a human."
-        ),
-        "switch_to_status": (
-            "The caller explicitly states they want to check on a DIFFERENT, already-existing "
-            "claim, not the new incident currently being reported. This does NOT include asking "
-            "for more general information, details, or explanations about the incident being "
-            "reported -- that's a normal part of filing it."
-        ),
-        "switch_to_tow": (
-            "The caller explicitly states they want general towing or roadside assistance "
-            "information and have stopped wanting to continue reporting this incident. This does "
-            "NOT include asking for more general information, details, or explanations about the "
-            "incident being reported -- that's a normal part of filing it."
-        ),
-    }
-)
+# transfer_to_human. Named so a test can check the card is complete
+# (status_flow's card was missing its own "another one" move, found live).
+_INTENTS = {
+    "transfer_to_human": (
+        "The caller explicitly asks to speak to a human, a representative, or a supervisor; "
+        "disputes who was at fault; mentions a lawyer, attorney, lawsuit, or formal complaint; "
+        "or states that they are not the policyholder and are calling on someone else's behalf. "
+        "Also covers the caller wanting to enroll in a new policy, become a new customer, or "
+        "get an insurance quote -- this line only handles existing policies and claims. This "
+        "does NOT include the caller asking what information is still needed, asking about "
+        "their own claim or vehicle details, or asking general questions about the process -- "
+        "those are normal parts of filing a claim, not a request for a human."
+    ),
+    "transfer_for_claim_history": (
+        "The caller asks how many claims they have, for a list of their claims, or about their "
+        "claim history. This line can only look up one claim at a time by its number."
+    ),
+    "switch_to_fnol": (
+        "The caller wants to report a SECOND, separate incident, different from the one just "
+        "reported. This does NOT include adding or correcting details of the incident being "
+        "reported -- that's a normal part of filing it."
+    ),
+    "switch_to_status": (
+        "The caller explicitly states they want to check on a DIFFERENT, already-existing "
+        "claim, not the new incident currently being reported. This does NOT include asking "
+        "for more general information, details, or explanations about the incident being "
+        "reported -- that's a normal part of filing it."
+    ),
+    "switch_to_tow": (
+        "The caller explicitly states they want general towing or roadside assistance "
+        "information and have stopped wanting to continue reporting this incident. This does "
+        "NOT include asking for more general information, details, or explanations about the "
+        "incident being reported -- that's a normal part of filing it."
+    ),
+}
+_intent = IntentRecognizer(_INTENTS)
 
 # H9's deflection guard is deterministic (code), not another model call
 # stacked on top of the intent recognizer -- same reasoning as tow_flow's
@@ -92,10 +103,17 @@ _COVERAGE_FAULT_LEGAL_KEYWORDS = (
     "lawyer",
     "sue",
     "complaint",
-    "how much will i",
-    "payout",
-    "pay out",
     "settlement",
+    # "how much will i" / "payout" / "pay out" were too narrow: "how much do
+    # I have to pay for this?" fell through to the benign process-question
+    # acknowledgment instead of being deflected. Unlike tow_flow, this flow
+    # has no FAQ to answer cost questions from, so any cost phrasing here
+    # should deflect to a representative.
+    "how much",
+    "pay",
+    "cost",
+    "charge",
+    "price",
 )
 
 
@@ -134,40 +152,82 @@ def _check_loss_at_not_future(value: object) -> tuple[bool, str]:
 
 
 def start(call: guava.Call) -> None:
-    call.set_task(
-        "fnol_identity",
-        objective=(
+    # Reset this flow's per-call state every time it (re)starts, not just
+    # on first entry. "Anything else?" (agent.py's wrap_up -> route ->
+    # switch_flow) makes a second pass through this flow in the same call
+    # a normal path: without this, a second incident reported in the same
+    # call would reuse the first claim's idempotency key (silently treated
+    # as a duplicate by the backend) and inherit its spent retry budgets.
+    # Counters reset to 0, not None: get_variable's default only applies
+    # when the variable is absent, so an explicit None reached the
+    # handler's "+ 1" and crashed it live (2026-10-06).
+    call.set_variable("fnol_idempotency_key", None)
+    call.set_variable("fnol_identity_attempts", 0)
+    call.set_variable("fnol_vehicle_confirm_attempts", 0)
+    _set_identity_task(call)
+
+
+_POLICY_NUMBER_GUIDANCE = (
+    "The policy number is on the caller's Mercury ID card or in their Mercury online account; "
+    "if they truly can't find it, offer to connect them with a representative who can look it "
+    "up a different way, rather than guessing or skipping it."
+)
+
+
+# Same idea as status_flow._set_identity_task: if this call already
+# verified a date of birth (at either desk), don't ask for it again --
+# only the policy number. The backend still exact-matches both values.
+def _set_identity_task(call: guava.Call, *, retry_note: str | None = None) -> None:
+    verified_dob = call.get_variable("call_verified_dob")
+
+    if verified_dob:
+        objective = (
+            "The caller's identity (date of birth) was already verified earlier in this call. "
+            f"Collect only the policy number -- do not ask for the date of birth again. "
+            f"{_POLICY_NUMBER_GUIDANCE} Do not discuss claim details, coverage, or policy status "
+            "until the policy is verified."
+        )
+        opening = "I can help you get another claim started. I'll just need the policy number."
+    else:
+        objective = (
             "Verify the caller's identity before collecting any claim information. Collect their "
-            "policy number and date of birth. Do not discuss claim details, coverage, or policy "
-            "status until identity is verified."
+            f"policy number and date of birth. {_POLICY_NUMBER_GUIDANCE} Do not discuss claim "
+            "details, coverage, or policy status until identity is verified."
+        )
+        opening = (
+            "I'm sorry to hear you may be dealing with a loss. I'll help you get a claim "
+            "started. First, I need to verify your identity."
+        )
+    if retry_note:
+        objective = f"{retry_note} {objective}"
+
+    checklist: list = [
+        guava.Say(opening),
+        guava.Say(
+            "Could you give me your policy number? You can say the digits after MCY-dash, "
+            "or enter them on your phone's keypad -- whichever's easier."
         ),
-        checklist=[
-            guava.Say(
-                "I'm sorry to hear you may be dealing with a loss. I'll help you get a claim "
-                "started. First, I need to verify your identity."
+        guava.Field(
+            key="fnol_policy_number_digits",
+            description=(
+                "The 6 digits after 'MCY-' in the caller's policy number. The prefix is "
+                "always MCY- and is not collected here. The caller may say the digits or "
+                "enter them on their phone's keypad."
             ),
-            guava.Say(
-                "Could you give me your policy number? You can say the digits after MCY-dash, "
-                "or enter them on your phone's keypad -- whichever's easier."
-            ),
-            guava.Field(
-                key="fnol_policy_number_digits",
-                description=(
-                    "The 6 digits after 'MCY-' in the caller's policy number. The prefix is "
-                    "always MCY- and is not collected here. The caller may say the digits or "
-                    "enter them on their phone's keypad."
-                ),
-                field_type="digit_sequence",
-                required=True,
-            ),
+            field_type="digit_sequence",
+            required=True,
+        ),
+    ]
+    if not verified_dob:
+        checklist.append(
             guava.Field(
                 key="fnol_dob",
                 description="The caller's date of birth, for identity verification",
                 field_type="date",
                 required=True,
-            ),
-        ],
-    )
+            )
+        )
+    call.set_task("fnol_identity", objective=objective, checklist=checklist)
 
 
 _agent.on_validate("fnol_policy_number_digits")(
@@ -184,8 +244,9 @@ def _on_identity_complete(call: guava.Call) -> None:
         return
 
     policy_number = f"MCY-{call.get_field('fnol_policy_number_digits')}"
+    carried_dob = call.get_variable("call_verified_dob")
     try:
-        dob = as_date(call.get_field("fnol_dob"))
+        dob = as_date(carried_dob if carried_dob else call.get_field("fnol_dob"))
     except (ValueError, KeyError, TypeError):
         # Belt-and-suspenders: if the field payload is ever a shape
         # as_date doesn't handle, fail cleanly and immediately instead of
@@ -203,6 +264,7 @@ def _on_identity_complete(call: guava.Call) -> None:
         case Ok(value) if value.verified:
             call.set_variable("fnol_policy_number", policy_number)
             call.set_variable("fnol_policyholder_name", value.holder_name)
+            call.set_variable("call_verified_dob", dob.isoformat())
             call.set_task(
                 "fnol_loss_basics",
                 objective=(
@@ -253,11 +315,27 @@ def _on_identity_complete(call: guava.Call) -> None:
             # Same failure shape either way: wrong policy number or wrong
             # DOB look identical, so the caller can't learn which was
             # wrong (F4/F5). Up to 2 attempts, then transfer (H5).
-            if attempts < 2:
+            if attempts < 2 and carried_dob:
+                # The carried DOB can't be corrected on a page that has no
+                # DOB blank -- drop the carry-over and ask for both.
+                call.set_variable("call_verified_dob", None)
+                _set_identity_task(
+                    call,
+                    retry_note=(
+                        "The policy number did not match our records. This time, collect both the "
+                        "policy number and the date of birth."
+                    ),
+                )
+            elif attempts < 2:
+                # Confirmed live (2026-10-05): "repeat both" wasn't enough --
+                # the caller re-said only one field, the model waited on the
+                # other one in silence for ~78s, and the platform hung up.
                 call.retry_task(
                     reason=(
                         "The policy number or date of birth did not match our records. Ask the "
-                        "caller to carefully repeat both."
+                        "caller to say or enter BOTH the policy number and the date of birth again "
+                        "in full -- repeating only one of them is not enough for another lookup "
+                        "attempt."
                     )
                 )
             else:
@@ -298,28 +376,61 @@ def _on_loss_basics_complete(call: guava.Call) -> None:
     call.set_task(
         "fnol_vehicle",
         objective=(
-            "Collect details about the insured vehicle: year, make, model, color, plate, how many "
-            "passengers (if known), a description of the damage, where the vehicle is now, and "
-            "whether it's still drivable."
+            "Collect details about the insured vehicle: year, make, model, color, plate (and the "
+            "state that issued it, if known), how many passengers not counting the driver (if "
+            "known), a description of the damage, whether any other property was damaged, where "
+            "the vehicle is now, and whether it's still drivable."
         ),
-        checklist=[
-            guava.Field(key="fnol_vehicle_year", description="The insured vehicle's model year", field_type="integer", required=True),
-            guava.Field(key="fnol_vehicle_make", description="The insured vehicle's make", field_type="text", required=True),
-            guava.Field(key="fnol_vehicle_model", description="The insured vehicle's model", field_type="text", required=True),
-            guava.Field(key="fnol_vehicle_color", description="The insured vehicle's color", field_type="text", required=True),
-            guava.Field(key="fnol_vehicle_plate", description="The insured vehicle's license plate", field_type="text", required=True),
-            guava.Field(key="fnol_passenger_count", description="Number of passengers in the insured vehicle, if known", field_type="integer", required=False),
-            guava.Field(key="fnol_damage_description", description="A description of the damage to the insured vehicle", field_type="text", required=True),
-            guava.Field(key="fnol_vehicle_location", description="Where the insured vehicle currently is", field_type="text", required=True),
-            guava.Field(
-                key="fnol_drivable",
-                description="Whether the insured vehicle is still drivable",
-                field_type="multiple_choice",
-                choices=["yes", "no"],
-                required=True,
-            ),
-        ],
+        checklist=_fnol_vehicle_checklist(),
     )
+
+
+def _fnol_vehicle_checklist() -> list:
+    # One definition, used for both the first ask and the re-ask after a
+    # failed read-back confirmation, so the two can't drift apart.
+    return [
+        guava.Field(key="fnol_vehicle_year", description="The insured vehicle's model year", field_type="integer", required=True),
+        guava.Field(key="fnol_vehicle_make", description="The insured vehicle's make", field_type="text", required=True),
+        guava.Field(key="fnol_vehicle_model", description="The insured vehicle's model", field_type="text", required=True),
+        guava.Field(key="fnol_vehicle_color", description="The insured vehicle's color", field_type="text", required=True),
+        guava.Field(key="fnol_vehicle_plate", description="The insured vehicle's license plate", field_type="text", required=True),
+        guava.Field(
+            key="fnol_vehicle_plate_state",
+            description="The state that issued the insured vehicle's license plate, if known",
+            field_type="text",
+            required=False,
+        ),
+        # "not counting the driver": confirmed live (2026-10-05) that "just
+        # me" was stored as 1 under the old wording.
+        guava.Field(
+            key="fnol_passenger_count",
+            description="Number of passengers in the insured vehicle, not counting the driver, if known",
+            field_type="integer",
+            required=False,
+        ),
+        guava.Field(key="fnol_damage_description", description="A description of the damage to the insured vehicle", field_type="text", required=True),
+        guava.Field(
+            key="fnol_property_damage",
+            description="Whether the incident damaged any property other than a vehicle, such as a fence, mailbox, or building",
+            field_type="multiple_choice",
+            choices=["yes", "no"],
+            required=True,
+        ),
+        guava.Field(
+            key="fnol_property_damage_description",
+            description="A description of the property damage, if any",
+            field_type="text",
+            required=False,
+        ),
+        guava.Field(key="fnol_vehicle_location", description="Where the insured vehicle currently is", field_type="text", required=True),
+        guava.Field(
+            key="fnol_drivable",
+            description="Whether the insured vehicle is still drivable",
+            field_type="multiple_choice",
+            choices=["yes", "no"],
+            required=True,
+        ),
+    ]
 
 
 def _submit_partial_claim_for_injury(call: guava.Call) -> None:
@@ -338,6 +449,7 @@ def _submit_partial_claim_for_injury(call: guava.Call) -> None:
             # H2: injuries reported -> save a partial record, then
             # transfer. Only say "saved" because the write was confirmed.
             set_outcome(call, "claim_created", transfer_reason="injury_reported")
+            call.set_variable("call_claim_number", value.claim_number)
             transfer_to_human(
                 call,
                 instructions=(
@@ -366,6 +478,85 @@ def _on_vehicle_complete(call: guava.Call) -> None:
         set_outcome(call, "transferred", transfer_reason="validation_exhausted")
         transfer_to_human(call)
         return
+    _start_vehicle_confirm(call)
+
+
+# Read-back before filing. Confirmed live (2026-10-05): the model stored
+# "Ultima" for a spoken "Altima", plate "MCP" for "MCP510", and report
+# number "88" for "88095" -- a human agent would have read these back
+# before filing. The read-back is built in code from the stored values,
+# so what's confirmed is what will actually be submitted, not whatever
+# the model happens to repeat.
+def _start_vehicle_confirm(call: guava.Call) -> None:
+    plate = call.get_field("fnol_vehicle_plate")
+    plate_state = call.get_field("fnol_vehicle_plate_state")
+    plate_text = f"{plate}, {plate_state}" if plate_state else plate
+    property_damage_note = ""
+    if call.get_field("fnol_property_damage") == "yes":
+        description = call.get_field("fnol_property_damage_description") or "as described"
+        property_damage_note = f" You also mentioned damage to other property: {description}."
+    call.set_task(
+        "fnol_vehicle_confirm",
+        objective=(
+            f"Read back to the caller: a {call.get_field('fnol_vehicle_year')} "
+            f"{call.get_field('fnol_vehicle_color')} {call.get_field('fnol_vehicle_make')} "
+            f"{call.get_field('fnol_vehicle_model')}, plate {plate_text}. The damage is: "
+            f"{call.get_field('fnol_damage_description')}.{property_damage_note} The vehicle is "
+            f"currently at {call.get_field('fnol_vehicle_location')}. Ask the caller to confirm "
+            f"this is all correct before continuing."
+        ),
+        checklist=[
+            guava.Field(
+                key="fnol_vehicle_confirmed",
+                description="Whether the caller confirms the vehicle details just read back are correct",
+                field_type="multiple_choice",
+                choices=["yes", "no"],
+                required=True,
+            ),
+        ],
+    )
+
+
+@_agent.on_task_complete("fnol_vehicle_confirm")
+def _on_vehicle_confirm_complete(call: guava.Call) -> None:
+    if needs_handoff(call):
+        set_outcome(call, "transferred", transfer_reason="validation_exhausted")
+        transfer_to_human(call)
+        return
+
+    if call.get_field("fnol_vehicle_confirmed") == "yes":
+        _start_police_report(call)
+        return
+
+    # Bounded, same as every other retry in this codebase: one re-ask,
+    # then a human -- never an open-ended correction loop.
+    attempts = call.get_variable("fnol_vehicle_confirm_attempts", 0) + 1
+    call.set_variable("fnol_vehicle_confirm_attempts", attempts)
+    if attempts >= 2:
+        set_outcome(call, "transferred", transfer_reason="vehicle_details_unconfirmed")
+        transfer_to_human(
+            call,
+            instructions=(
+                "Let the caller know you want to make sure the vehicle details are recorded "
+                "correctly, and connect them with a representative who can go over them."
+            ),
+        )
+        return
+
+    # Re-collect the whole vehicle task rather than guess which one field
+    # was wrong -- the Field framework has no "edit just this value"
+    # mechanism, so a full re-ask is the safe option.
+    call.set_task(
+        "fnol_vehicle",
+        objective=(
+            "Some of the vehicle details weren't quite right. Collect them again: year, make, "
+            "model, color, plate, and the rest of the vehicle details."
+        ),
+        checklist=_fnol_vehicle_checklist(),
+    )
+
+
+def _start_police_report(call: guava.Call) -> None:
     call.set_task(
         "fnol_police_report",
         objective="Find out whether a police report was filed for this incident.",
@@ -420,9 +611,12 @@ def _submit_claim(call: guava.Call) -> None:
             "model": call.get_field("fnol_vehicle_model"),
             "color": call.get_field("fnol_vehicle_color"),
             "plate": call.get_field("fnol_vehicle_plate"),
+            "plate_state": call.get_field("fnol_vehicle_plate_state"),
         },
         "passenger_count": call.get_field("fnol_passenger_count"),
         "damage_description": call.get_field("fnol_damage_description"),
+        "property_damage": call.get_field("fnol_property_damage"),
+        "property_damage_description": call.get_field("fnol_property_damage_description"),
         "vehicle_location": call.get_field("fnol_vehicle_location"),
         "other_party": {
             "name": call.get_field("fnol_other_party_name"),
@@ -449,6 +643,7 @@ def _submit_claim(call: guava.Call) -> None:
     match result:
         case Ok(value):
             call.set_variable("fnol_claim_number", value.claim_number)
+            call.set_variable("call_claim_number", value.claim_number)
             if not drivable:
                 call.set_task(
                     "fnol_tow_offer",
@@ -532,13 +727,19 @@ def _finish_claim(call: guava.Call, claim_number: str) -> None:
     set_outcome(call, "claim_created")
     policyholder = call.get_variable("fnol_policyholder_name")
     sms_note = _sms_confirmation_note(call, claim_number)
-    call.hangup(
-        final_instructions=(
+    # Preferred shop / rental / photos are how Mercury's own claims pages
+    # describe what happens next -- phrased as what a representative "can
+    # help" with, never as a promise about this claim.
+    end_call_with_wrapup(
+        call,
+        (
             f"Let {policyholder} know their claim has been filed successfully. Their claim number "
-            f"is {claim_number}.{sms_note} A representative will follow up -- do not give a "
-            f"specific timeline or promise a callback window. Thank them for calling, and politely "
-            f"say goodbye."
-        )
+            f"is {claim_number}.{sms_note} A representative will follow up, and can help locate "
+            f"one of Mercury's preferred repair shops and arrange a rental vehicle if needed. Do "
+            f"not give a specific timeline or promise a callback window. If the caller hasn't "
+            f"already, suggest they take photos of the vehicle damage and the scene for their "
+            f"records."
+        ),
     )
 
 
@@ -567,29 +768,33 @@ def _on_tow_offer_complete(call: guava.Call) -> None:
         case Ok(value):
             set_outcome(call, "claim_created")
             sms_note = _sms_confirmation_note(call, claim_number)
-            call.hangup(
-                final_instructions=(
-                    f"Let {policyholder} know their claim number is {claim_number}, and that you've "
-                    f"requested a tow -- {value.provider_name} is expected in approximately "
+            end_call_with_wrapup(
+                call,
+                (
+                    f"Let {policyholder} know their claim number is {claim_number}, and that "
+                    f"you've requested a tow -- {value.provider_name} is expected in approximately "
                     f"{value.eta_minutes} minutes. Make clear the ETA is approximate.{sms_note} A "
-                    f"representative will follow up on the claim. Thank them and politely say "
-                    f"goodbye."
-                )
+                    f"representative will follow up on the claim, and can help locate one of "
+                    f"Mercury's preferred repair shops."
+                ),
             )
         case _:
             set_outcome(call, "claim_created", transfer_reason="tow_request_failed")
             sms_note = _sms_confirmation_note(call, claim_number)
-            call.hangup(
-                final_instructions=(
-                    f"Let {policyholder} know their claim number is {claim_number}. Let them know the "
-                    f"tow could not be requested right now due to a system issue, and that a "
+            end_call_with_wrapup(
+                call,
+                (
+                    f"Let {policyholder} know their claim number is {claim_number}. Let them know "
+                    f"the tow could not be requested right now due to a system issue, and that a "
                     f"representative will follow up and can help arrange one. Do NOT say a tow has "
-                    f"been requested.{sms_note} Thank them and politely say goodbye."
-                )
+                    f"been requested.{sms_note}"
+                ),
             )
 
 
 def handle_question(call: guava.Call, question: str) -> str:
+    if is_claim_history_question(question):
+        return copy.CLAIM_HISTORY_DEFLECTION
     if _is_coverage_fault_or_legal(question):
         # H9: coverage/fault/legal questions are deflected to a human;
         # the agent does intake only, never a determination.

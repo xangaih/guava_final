@@ -5,7 +5,7 @@ real DocumentQA (which would otherwise upload documents to the Guava
 server on first use).
 """
 
-from guava.commands import SendInstructionCommand, TransferCommand
+from guava.commands import SetTaskCommand, TransferCommand
 from guava.testing import MockCall
 from guava.types.call_info import PSTNCallInfo
 
@@ -26,14 +26,33 @@ def test_needs_dispatch_transfers_to_roadside_line(monkeypatch):
     assert call.get_variable("call_outcome") == "transferred"
 
 
-def test_no_dispatch_needed_just_hangs_up():
+def test_no_dispatch_needed_offers_anything_else_before_ending():
     call = _call()
     call.set_field("tow_needs_dispatch", "no")
     tow_flow._on_tow_intent_complete(call)
     transfers = [c for c in call._command_queue if isinstance(c, TransferCommand)]
     assert not transfers
-    assert any(isinstance(c, SendInstructionCommand) for c in call._command_queue)
+    tasks = [c for c in call._command_queue if isinstance(c, SetTaskCommand)]
+    assert tasks[-1].task_id == "wrap_up"
+    assert "anything else" in tasks[-1].objective.lower()
     assert call.get_variable("call_outcome") == "completed"
+
+
+def test_general_pricing_question_reaches_the_faq_not_the_deflection(monkeypatch):
+    # A general "what's the price" question is exactly what the FAQ's
+    # tier/dollar content exists to answer -- it must NOT be caught by the
+    # caller-specific guard (which would short-circuit the FAQ entirely).
+    call = _call()
+    monkeypatch.setattr(tow_flow.faq, "ask", lambda q: "Three tiers: up to $75, $500, or $1,000.")
+    answer = tow_flow.handle_question(call, "What's the price for a 100 mile tow?")
+    assert "$500" in answer
+
+
+def test_personal_cost_question_is_still_deflected(monkeypatch):
+    call = _call()
+    monkeypatch.setattr(tow_flow.faq, "ask", lambda q: "should not be reached")
+    for question in ["Do I have to pay for the tow?", "Will I be charged for this?", "How much will I owe?"]:
+        assert tow_flow.handle_question(call, question) == tow_flow.copy.COVERAGE_DEFLECTION
 
 
 def test_general_question_answered_from_faq(monkeypatch):

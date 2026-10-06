@@ -225,37 +225,69 @@ def on_call_received(call_info: guava.CallInfo) -> guava.IncomingCallAction:
     return guava.AcceptCall()
 
 
+# Shared across on_call_start (first ask) and _on_wrap_up_complete's "yes"
+# branch (re-ask after "anything else?") -- one definition so the two call
+# sites' choices can't silently drift apart.
+_ROUTE_PURPOSE_FIELD = guava.Field(
+    key="call_purpose",
+    description=(
+        "Why the caller is contacting Mercury Insurance Auto Claims. Choose "
+        "'talk_to_representative' if they explicitly ask for a person instead of answering this "
+        "question. Choose 'different_insurance_type' if they're asking about a home, property, "
+        "or mechanical protection claim, or anything that isn't an auto claim."
+    ),
+    field_type="multiple_choice",
+    choices=[
+        "report_new_claim",
+        "check_claim_status",
+        "towing_or_roadside_question",
+        "talk_to_representative",
+        "different_insurance_type",
+        "something_else",
+    ],
+    required=True,
+)
+
+
 @agent.on_call_start
 def on_call_start(call: guava.Call) -> None:
     call.read_script(copy.OPENING_DISCLOSURE)
     call.set_task(
         ROUTE_TASK,
         objective="Find out why the caller is contacting Mercury Insurance's auto claims line.",
-        checklist=[
-            guava.Field(
-                key="call_purpose",
-                description="Why the caller is contacting Mercury Insurance Auto Claims",
-                field_type="multiple_choice",
-                choices=[
-                    "report_new_claim",
-                    "check_claim_status",
-                    "towing_or_roadside_question",
-                    "something_else",
-                ],
-                required=True,
-            ),
-        ],
+        checklist=[_ROUTE_PURPOSE_FIELD],
     )
 
 
 @agent.on_task_complete(ROUTE_TASK)
 def on_route_complete(call: guava.Call) -> None:
     purpose = call.get_field("call_purpose")
+
+    if purpose == "different_insurance_type":
+        # Mercury also sells home/property and mechanical protection
+        # coverage and runs a separate catastrophe line; this auto-claims
+        # agent has no business handling any of those, so it says so
+        # specifically rather than giving the same generic transfer as an
+        # unrecognized purpose.
+        set_outcome(call, "transferred", transfer_reason=purpose)
+        transfer_to_human(
+            call,
+            instructions=(
+                "Let the caller know this line handles auto claims, and that you're connecting "
+                "them with the right Mercury team for their home, property, or mechanical "
+                "protection question."
+            ),
+        )
+        return
+
     flow_name = FLOW_BY_PURPOSE.get(purpose)
 
     if flow_name is None:
-        # "something_else", or anything unrecognized.
-        set_outcome(call, "transferred", transfer_reason="something_else")
+        # "talk_to_representative", "something_else", or anything
+        # unrecognized -- transfer_reason now carries the actual purpose
+        # value instead of a hardcoded "something_else", so the audit
+        # trail can tell these apart.
+        set_outcome(call, "transferred", transfer_reason=purpose)
         transfer_to_human(call)
         return
 
@@ -296,6 +328,34 @@ def on_transfer_to_human(call: guava.Call) -> None:
     transfer_to_human(call)
 
 
+# "How many claims do I have?" can arrive on either channel: as a question
+# (-> handle_question, keyword guard below) or as an action request (-> this
+# action). Either way the caller hears the true limitation, and the audit
+# row records why the transfer happened instead of a generic reason.
+CLAIM_HISTORY_KEYWORDS = (
+    "how many claims",
+    "my claims",
+    "all my claims",
+    "other claims",
+    "claim history",
+    "list my claims",
+    "list of claims",
+    "previous claims",
+    "past claims",
+)
+
+
+def is_claim_history_question(question: str) -> bool:
+    q = question.lower()
+    return any(kw in q for kw in CLAIM_HISTORY_KEYWORDS)
+
+
+@agent.on_action("transfer_for_claim_history")
+def on_transfer_for_claim_history(call: guava.Call) -> None:
+    set_outcome(call, "transferred", transfer_reason="claim_history_request")
+    transfer_to_human(call, instructions=copy.TRANSFER_CLAIM_HISTORY)
+
+
 # --- Mid-call flow switching ---
 #
 # Confirmed live (2026-10-05): a caller mid-call in tow_flow said "I
@@ -332,6 +392,52 @@ def on_switch_to_tow(call: guava.Call) -> None:
     switch_flow(call, "tow")
 
 
+# --- Wrap-up: "anything else?" before hanging up ---
+#
+# call.hangup() can't ask a question and wait for an answer -- it just
+# tells the model to wrap up and end the call on its own. Every
+# self-service success point (claim filed, status delivered, tow FAQ
+# answered with no dispatch needed) used to call call.hangup() directly,
+# so the caller was never reliably asked whether there was anything else
+# -- some calls got it because the model improvised one, most didn't.
+# end_call_with_wrapup() replaces that direct hangup call with a real task
+# (a Field, not a bare Say) so the answer actually gates what happens
+# next: "no" hangs up same as before; "yes" re-enters ROUTE_TASK, reusing
+# on_route_complete's already-tested dispatch instead of new logic.
+WRAP_UP_TASK = "wrap_up"
+
+
+def end_call_with_wrapup(call: guava.Call, closing_instructions: str) -> None:
+    call.set_task(
+        WRAP_UP_TASK,
+        objective=(
+            f"{closing_instructions} Then ask whether there's anything else you can help with "
+            f"today -- a new claim, a claim status, or a towing question."
+        ),
+        checklist=[
+            guava.Field(
+                key="wrap_up_wants_more",
+                description="Whether the caller has anything else they'd like help with on this call",
+                field_type="multiple_choice",
+                choices=["yes", "no"],
+                required=True,
+            ),
+        ],
+    )
+
+
+@agent.on_task_complete(WRAP_UP_TASK)
+def _on_wrap_up_complete(call: guava.Call) -> None:
+    if call.get_field("wrap_up_wants_more") == "yes":
+        call.set_task(
+            ROUTE_TASK,
+            objective="Find out what else the caller needs help with.",
+            checklist=[guava.Say("Sure -- what else can I help with?"), _ROUTE_PURPOSE_FIELD],
+        )
+    else:
+        call.hangup(final_instructions="Thank the caller for calling, and politely say goodbye.")
+
+
 @agent.on_session_end
 def on_session_end(call: guava.Call, event: BotSessionEnded) -> None:
     handlers = _current_flow(call)
@@ -340,12 +446,18 @@ def on_session_end(call: guava.Call, event: BotSessionEnded) -> None:
 
     # Audit write; failure here must never be fatal to the call -- it
     # already isn't, since record_call_session only ever logs on failure.
+    # summary comes from whichever flow is active when the call ends. With
+    # "anything else?" a caller can file a claim and then check status in
+    # the same call, so the claim created in the first half would be
+    # missing from the status flow's summary -- the flow-agnostic
+    # call_claim_number (set wherever a claim is actually created) keeps
+    # it in the audit row regardless.
     client.record_call_session(
         call_id=call.id,
         purpose=call.get_variable("flow"),
         outcome=outcome,
         transfer_reason=call.get_variable("call_transfer_reason"),
-        claim_number=summary.get("claim_number"),
+        claim_number=summary.get("claim_number") or call.get_variable("call_claim_number"),
     )
 
     logger.info(

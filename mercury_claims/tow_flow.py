@@ -15,7 +15,14 @@ from guava.helpers.llm import IntentRecognizer
 import guava
 
 from . import config, copy, faq
-from .agent import FlowHandlers, needs_handoff, register_flow, set_outcome, transfer_to_human
+from .agent import (
+    FlowHandlers,
+    end_call_with_wrapup,
+    needs_handoff,
+    register_flow,
+    set_outcome,
+    transfer_to_human,
+)
 from .agent import agent as _agent
 
 # Confirmed live (2026-10-05): this flow never registered a
@@ -36,28 +43,29 @@ from .agent import agent as _agent
 # sharp, vivid positive trigger (an actual new incident) and phrase the
 # exclusion abstractly ("more general information") instead of
 # repeating topic keywords.
-_intent = IntentRecognizer(
-    {
-        "transfer_to_human": (
-            "The caller explicitly asks to speak to a human, a representative, or a supervisor. "
-            "This does NOT include the caller asking general towing/roadside questions, or "
-            "asking about towing distances, costs, or what's covered -- those are normal parts "
-            "of this call, not a request for a human."
-        ),
-        "switch_to_fnol": (
-            "The caller explicitly states they were just in an accident, their car was just hit, "
-            "or they need to report a brand new incident right now. This does NOT include asking "
-            "for more general information, details, or explanations about anything already being "
-            "discussed -- that's a normal follow-up question, not a new incident."
-        ),
-        "switch_to_status": (
-            "The caller explicitly states they want to check on an existing claim they already "
-            "filed. This does NOT include asking for more general information, details, or "
-            "explanations about anything already being discussed -- that's a normal follow-up "
-            "question, not a request to check a claim."
-        ),
-    }
-)
+_INTENTS = {
+    "transfer_to_human": (
+        "The caller explicitly asks to speak to a human, a representative, or a supervisor. "
+        "This does NOT include the caller asking general towing/roadside questions, or "
+        "asking about towing distances, costs, or what's covered -- those are normal parts "
+        "of this call, not a request for a human."
+    ),
+    "switch_to_fnol": (
+        "The caller explicitly states they were just in an accident, their car was just hit, "
+        "or they need to report a brand new incident right now. This does NOT include asking "
+        "for more general information, details, or explanations about anything already being "
+        "discussed -- that's a normal follow-up question, not a new incident."
+    ),
+    "switch_to_status": (
+        "The caller explicitly states they want to check on an existing claim they already "
+        "filed. This does NOT include asking for more general information, details, or "
+        "explanations about anything already being discussed -- that's a normal follow-up "
+        "question, not a request to check a claim."
+    ),
+}
+# No switch_to_tow here on purpose: "another towing question" is just
+# another question on the same open page, not a restart.
+_intent = IntentRecognizer(_INTENTS)
 
 _PERSONAL_COVERAGE_KEYWORDS = (
     "my policy",
@@ -89,11 +97,15 @@ def _is_caller_specific(question: str) -> bool:
 def start(call: guava.Call) -> None:
     call.set_task(
         "tow_intent",
+        # "only once, near the end": confirmed live (2026-10-05) that with
+        # the dispatch field marked required, the model re-asked "do you
+        # need a tow right now?" after every single FAQ answer.
         objective=(
             "The caller has questions about towing or roadside assistance, or may need a tow "
             "dispatched right now for a current, non-accident breakdown. Answer any general "
-            "questions as they come up. Find out whether they need a tow or roadside dispatch "
-            "sent right now."
+            "questions fully as they come up. Ask whether they need a tow or roadside dispatch "
+            "sent right now only once, near the end of the conversation -- not after every "
+            "answer."
         ),
         checklist=[
             guava.Say(
@@ -137,7 +149,7 @@ def _on_tow_intent_complete(call: guava.Call) -> None:
         # than "completed" (0002 migration) -- it's genuinely not a
         # claim, a status delivery, or a transfer.
         set_outcome(call, "completed")
-        call.hangup(final_instructions="Thank the caller for calling, and politely say goodbye.")
+        end_call_with_wrapup(call, "Thank the caller for their question.")
 
 
 def handle_question(call: guava.Call, question: str) -> str:
