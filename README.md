@@ -225,9 +225,10 @@ table can be triggered on a live call.
   line. Better a clean hand-off than a fake dispatch.
 - **Mercury's other claim types (home, mechanical protection).** Recognized and routed to a person.
   Three call types done well beat five done shallowly.
-- **SMS confirmation turned on.** The code works and is tested offline, but the sandbox number isn't
-  provisioned for SMS. I prioritized a caller getting all the way to a claim number over a second
-  channel.
+- **SMS confirmation turned on.** The code works and is tested offline, and I tried it live on a
+  real phone: the send was rejected because the sandbox number isn't registered for texting
+  (carrier registration). So it stays off. I prioritized a caller getting all the way to a claim
+  number over a second channel.
 - **Stronger identity** (caller ID matched against the phone on the policy, a one-time code, lockout
   across calls). The right production answer, but it needs systems this demo doesn't have.
 - **Spanish.** A real need for Mercury's California customers; not attempted.
@@ -260,6 +261,11 @@ Honest list, so you see them here first:
   and "give me both again, in full" on an identity retry.
 - **One outcome per call in the audit log.** If a caller files a claim and then checks a status, the
   row records the last thing done (the claim number from earlier is kept).
+- **The app logs aren't fully free of personal data.** The audit table never holds names, phone
+  numbers or dates of birth, and my own end-of-call log line is redacted. But Guava's SDK logs the
+  caller's phone number on every incoming call, along with the text of questions and requests, and
+  the backend log includes ZIP codes. Production would filter those log lines and keep app logs
+  short-lived.
 
 ## How to run it
 
@@ -462,8 +468,10 @@ caller's own policy first; dispatch needs go to the roadside line. Rejected: rea
 scope); a model-based guard (can't be tested the way a keyword guard can).
 
 **PII-free audit trail; the date-of-birth crash** `[c5cfe5f]`
-What: every call writes outcome / transfer reason / claim number, no personal data; logs redacted.
-Found live: date fields arrive as a dictionary, not a string, which crashed identity on a real call.
+What: every call writes outcome / transfer reason / claim number to the audit table, with no
+personal data; my own end-of-call log line is redacted. Found live: a date field arrives as a
+dictionary (`{day, month, year}`), exactly as Guava's Field docs say. I had assumed a string
+without checking the docs, and it crashed identity on a real call. My miss, not an SDK surprise.
 
 **Keypad entry; SMS behind a flag** `[fae0a1d]`
 What: digit-sequence fields so callers can type numbers; SMS confirmation off by default. Rejected:
