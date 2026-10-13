@@ -1,11 +1,14 @@
 import logging
 import time
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from fastapi.responses import FileResponse
 from postgrest.exceptions import APIError
 
 from . import config, db
 from .schemas import (
+    CallEventCreate,
     CallSessionCreate,
     ClaimCreateRequest,
     ClaimCreateResponse,
@@ -122,6 +125,39 @@ def call_sessions_create(payload: CallSessionCreate):
         # (the agent's client) is expected to log this and move on too.
         logger.exception("call-session audit write failed")
         raise HTTPException(status_code=500, detail="audit write failed") from None
+
+
+# --- Rep dashboard (simulates what a Mercury representative would see) ---
+#
+# The agent posts events (call started, desk, verified, transfer with
+# hand-off context, call ended with a follow-up); the page polls them.
+# The two GET routes have no auth on purpose: uvicorn binds 127.0.0.1 by
+# default, so only this machine can reach them. A real deployment would
+# put a login in front and, more importantly, attach the hand-off context
+# to the transferred call itself rather than a page that matches by call.
+
+@app.post("/call-events", dependencies=[Depends(require_api_key)])
+def call_events_create(payload: CallEventCreate):
+    # Deliberately logs no details: they can contain the caller's name.
+    logger.info("POST /call-events call_id=%s type=%s", payload.call_id, payload.event_type)
+    try:
+        return db.create_call_event(payload)
+    except APIError:
+        logger.exception("call-event write failed")
+        raise HTTPException(status_code=500, detail="call-event write failed") from None
+
+
+@app.get("/rep/events")
+def rep_events(limit: int = 200) -> list[dict]:
+    return db.list_call_events(min(limit, 500))
+
+
+_REP_PAGE = Path(__file__).parent / "static" / "rep.html"
+
+
+@app.get("/rep", include_in_schema=False)
+def rep_page():
+    return FileResponse(_REP_PAGE)
 
 
 @app.post("/admin/fault", dependencies=[Depends(require_admin_token)])

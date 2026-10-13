@@ -6,6 +6,7 @@ from supabase import Client, create_client
 
 from . import config
 from .schemas import (
+    CallEventCreate,
     CallSessionCreate,
     ClaimCreateRequest,
     ClaimCreateResponse,
@@ -177,3 +178,21 @@ def create_call_session(payload: CallSessionCreate) -> dict:
     client = get_client()
     insert_res = client.table("call_sessions").insert(payload.model_dump()).execute()
     return {"recorded": True, "id": insert_res.data[0]["id"]}
+
+
+def create_call_event(payload: CallEventCreate) -> dict:
+    client = get_client()
+    insert_res = client.table("call_events").insert(payload.model_dump()).execute()
+    return {"recorded": True, "id": insert_res.data[0]["id"]}
+
+
+def list_call_events(limit: int = 200) -> list[dict]:
+    client = get_client()
+    res = (
+        client.table("call_events")
+        .select("call_id, event_type, details, created_at")
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return res.data

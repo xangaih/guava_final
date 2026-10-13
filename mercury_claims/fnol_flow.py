@@ -29,6 +29,7 @@ from .agent import (
     end_call_with_wrapup,
     is_claim_history_question,
     needs_handoff,
+    record_event,
     register_flow,
     set_outcome,
     transfer_to_human,
@@ -267,6 +268,7 @@ def _on_identity_complete(call: guava.Call) -> None:
             call.set_variable("fnol_policy_number", policy_number)
             call.set_variable("fnol_policyholder_name", value.holder_name)
             call.set_variable("call_verified_dob", dob.isoformat())
+            record_event(call, "verified", {"name": value.holder_name, "policy_number": policy_number})
             call.set_task(
                 "fnol_loss_basics",
                 objective=(

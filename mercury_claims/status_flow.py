@@ -24,6 +24,7 @@ from .agent import (
     end_call_with_wrapup,
     is_claim_history_question,
     needs_handoff,
+    record_event,
     register_flow,
     set_outcome,
     transfer_to_human,
@@ -257,6 +258,7 @@ def _on_identity_complete(call: guava.Call) -> None:
         case Ok(value):
             call.set_variable("status_claim_number", claim_number)
             call.set_variable("call_verified_dob", dob.isoformat())
+            record_event(call, "verified", {"claim_number": claim_number})
             _deliver_status(call, value.status, value.adjuster_name, value.adjuster_phone)
         case NotFound():
             # Same shape whether the claim doesn't exist or the DOB/ZIP

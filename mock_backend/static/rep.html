@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mercury Claims — Rep Desk</title>
+<style>
+  :root { --bg:#f5f6f8; --card:#fff; --ink:#1b1c1e; --muted:#6b7280; --line:#e5e7eb;
+          --red:#c62828; --orange:#ef6c00; --yellow:#b58100; --green:#2e7d32; --blue:#1565c0; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.45 -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--ink); }
+  header { display:flex; align-items:center; gap:12px; padding:14px 24px; background:#fff; border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0; }
+  header .demo { font-size:12px; color:var(--muted); }
+  #status { margin-left:auto; font-size:12px; color:var(--muted); }
+  main { display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:16px; padding:16px 24px; }
+  @media (max-width: 1000px) { main { grid-template-columns:1fr; } }
+  section h2 { font-size:12px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); margin:0 0 10px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; margin-bottom:10px; }
+  .card .top { display:flex; align-items:center; gap:8px; margin-bottom:6px; }
+  .badge { font-size:11px; font-weight:600; padding:2px 8px; border-radius:999px; color:#fff; background:var(--muted); }
+  .badge.red { background:var(--red); } .badge.orange { background:var(--orange); }
+  .badge.yellow { background:var(--yellow); } .badge.green { background:var(--green); } .badge.blue { background:var(--blue); }
+  .when { margin-left:auto; font-size:11px; color:var(--muted); white-space:nowrap; }
+  .kv { display:grid; grid-template-columns:max-content 1fr; gap:2px 12px; font-size:13px; }
+  .kv dt { color:var(--muted); } .kv dd { margin:0; }
+  .quote { margin-top:6px; padding:6px 10px; background:#f3f4f6; border-radius:6px; font-style:italic; }
+  .empty { color:var(--muted); font-size:13px; padding:8px 2px; }
+  .action { font-weight:600; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Mercury Auto Claims — Rep Desk</h1>
+  <span class="demo">demo · fake data · refreshes every 2s</span>
+  <span id="status">connecting…</span>
+</header>
+<main>
+  <section><h2>Live calls</h2><div id="live"></div></section>
+  <section><h2>Transfers — screen pop</h2><div id="transfers"></div></section>
+  <section><h2>Follow-up queue</h2><div id="followups"></div></section>
+</main>
+<script>
+const REASON_LABEL = {
+  injury_reported: ["INJURY", "red"],
+  injury_reported_save_failed: ["INJURY · save failed", "red"],
+  backend_unavailable: ["SYSTEM DOWN", "orange"],
+  claim_submit_failed: ["CLAIM NOT FILED · system down", "orange"],
+  dob_unparseable: ["SYSTEM ISSUE", "orange"],
+  unrecognized_status: ["SYSTEM ISSUE", "orange"],
+  identity_mismatch: ["IDENTITY FAILED", "yellow"],
+  validation_exhausted: ["STUCK CALLER", "yellow"],
+  vehicle_details_unconfirmed: ["DETAILS UNCONFIRMED", "yellow"],
+  status_denied: ["DENIED CLAIM", "red"],
+  status_needs_human: ["NEEDS A PERSON", "red"],
+  mid_call_intent: ["ASKED FOR A PERSON", "blue"],
+  talk_to_representative: ["ASKED FOR A PERSON", "blue"],
+  something_else: ["OTHER REQUEST", "blue"],
+  different_insurance_type: ["NOT AN AUTO CLAIM", "blue"],
+  claim_history_request: ["CLAIM HISTORY", "blue"],
+  roadside_dispatch_needed: ["NEEDS A TOW NOW", "green"],
+};
+const DESK_LABEL = { fnol: "New claim", status: "Claim status", tow: "Roadside" };
+
+function esc(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+function when(iso) { const d = new Date(iso); return d.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit", second:"2-digit"}); }
+function badge(reason) {
+  const [label, color] = REASON_LABEL[(reason || "").replace(/^post_completion:/, "")] || [reason || "TRANSFER", ""];
+  return `<span class="badge ${color}">${esc(label)}</span>`;
+}
+function kv(pairs) {
+  const rows = pairs.filter(([, v]) => v !== undefined && v !== null && v !== "").map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`);
+  return rows.length ? `<dl class="kv">${rows.join("")}</dl>` : "";
+}
+function fmtWhen(v) {
+  if (v && typeof v === "object") { const p = n => String(n).padStart(2, "0"); return `${v.year}-${p(v.month)}-${p(v.day)}` + (v.hour != null ? ` ${p(v.hour)}:${p(v.minute ?? 0)}` : ""); }
+  return v;
+}
+
+function render(events) {
+  // events arrive newest first; group per call
+  const calls = new Map();
+  for (const e of [...events].reverse()) {
+    if (!calls.has(e.call_id)) calls.set(e.call_id, { id: e.call_id, started: null, ended: null, desk: null, verified: null, last4: null });
+    const c = calls.get(e.call_id), d = e.details || {};
+    if (e.event_type === "call_started") { c.started = e.created_at; c.last4 = d.caller_last4; }
+    if (e.event_type === "desk") c.desk = d.desk;
+    if (e.event_type === "verified") c.verified = d;
+    if (e.event_type === "call_ended") c.ended = e.created_at;
+  }
+
+  const live = [...calls.values()].filter(c => c.started && !c.ended).reverse();
+  document.getElementById("live").innerHTML = live.length ? live.map(c => `
+    <div class="card"><div class="top"><span class="badge green">IN PROGRESS</span><span class="when">${when(c.started)}</span></div>
+    ${kv([["caller", c.last4 ? `••• ${c.last4}` : "hidden number"], ["desk", DESK_LABEL[c.desk] || "choosing"],
+          ["verified", c.verified ? (c.verified.name || c.verified.claim_number || "yes") : "not yet"]])}</div>`).join("")
+    : `<div class="empty">No calls in progress.</div>`;
+
+  const transfers = events.filter(e => e.event_type === "transfer").slice(0, 20);
+  document.getElementById("transfers").innerHTML = transfers.length ? transfers.map(e => { const d = e.details || {}, col = d.collected || {}; return `
+    <div class="card"><div class="top">${badge(d.reason)}<span class="when">${when(e.created_at)}</span></div>
+    ${kv([["caller", d.name || (d.caller_last4 ? `••• ${d.caller_last4}` : "")], ["identity", d.verified ? "verified ✓" : "NOT verified"],
+          ["policy", d.policy_number], ["claim", d.claim_number], ["desk", DESK_LABEL[d.desk] || d.desk],
+          ["incident", col.loss_type], ["where", col.loss_location], ["when", fmtWhen(col.loss_at)],
+          ["injuries", col.injuries], ["drivable", col.drivable]])}
+    ${d.last_request ? `<div class="quote">Caller: “${esc(d.last_request)}”</div>` : ""}</div>`; }).join("")
+    : `<div class="empty">No transfers yet.</div>`;
+
+  const fups = events.filter(e => e.event_type === "call_ended" && e.details && e.details.follow_up).slice(0, 20);
+  document.getElementById("followups").innerHTML = fups.length ? fups.map(e => { const d = e.details; return `
+    <div class="card"><div class="top"><span class="badge yellow">TO DO</span><span class="when">${when(e.created_at)}</span></div>
+    <div class="action">${esc(d.follow_up)}</div>${kv([["outcome", d.outcome], ["claim", d.claim_number]])}</div>`; }).join("")
+    : `<div class="empty">Nothing waiting.</div>`;
+}
+
+async function tick() {
+  try {
+    const r = await fetch("/rep/events?limit=300", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    render(await r.json());
+    document.getElementById("status").textContent = "live · " + new Date().toLocaleTimeString();
+  } catch (err) {
+    document.getElementById("status").textContent = "backend unreachable: " + err.message;
+  }
+}
+tick();
+setInterval(tick, 2000);
+</script>
+</body>
+</html>

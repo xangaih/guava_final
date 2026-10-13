@@ -7,6 +7,7 @@ a backend problem, so flow code never has to branch on a raw exception.
 """
 
 import logging
+import threading
 from datetime import date, datetime
 
 import httpx
@@ -174,6 +175,25 @@ class Client:
                 logger.error("/call-sessions: audit write failed (HTTP %d)", resp.status_code)
         except httpx.HTTPError as exc:
             logger.error("/call-sessions: audit write failed (%s)", exc)
+
+    def record_call_event(self, call_id: str, event_type: str, details: dict | None = None) -> threading.Thread:
+        """Rep-dashboard event. Sent on a background thread with a short
+        timeout and nothing re-raised: a transfer or hang-up must never wait
+        on, or fail because of, the dashboard. Returns the thread so tests
+        can join it."""
+        payload = {"call_id": call_id, "event_type": event_type, "details": details or {}}
+
+        def send() -> None:
+            try:
+                resp = self._http.post("/call-events", json=payload, timeout=2.0)
+                if resp.status_code >= 400:
+                    logger.error("/call-events: write failed (HTTP %d)", resp.status_code)
+            except Exception as exc:  # noqa: BLE001 -- best-effort by design
+                logger.error("/call-events: write failed (%s)", exc)
+
+        thread = threading.Thread(target=send, daemon=True)
+        thread.start()
+        return thread
 
 
 # One shared instance (one connection pool) for every flow module.

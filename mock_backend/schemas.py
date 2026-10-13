@@ -79,6 +79,16 @@ class CallSessionCreate(BaseModel):
     api_errors: list = Field(default_factory=list)
 
 
+class CallEventCreate(BaseModel):
+    # What the rep dashboard shows. `details` is free-form on purpose (like
+    # claims.details): adding a new piece of hand-off context needs no
+    # migration. The agent never puts a date of birth or a full caller
+    # phone number in here.
+    call_id: str
+    event_type: Literal["call_started", "desk", "verified", "transfer", "call_ended"]
+    details: dict = Field(default_factory=dict)
+
+
 class FaultRequest(BaseModel):
     mode: Literal["none", "timeout", "slow", "500", "malformed", "not_found"]
     count: int = 1

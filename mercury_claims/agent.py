@@ -74,8 +74,75 @@ def _current_flow(call: guava.Call) -> Optional[FlowHandlers]:
     return _flows.get(call.get_variable("flow"))
 
 
+# --- Rep dashboard events (warm hand-off + post-call follow-ups) ---
+#
+# Everything a Mercury representative would want to see: that a call is in
+# progress, who it is once verified, the full context when a call is
+# transferred (so the caller doesn't start over), and what needs doing
+# after the call. Sent best-effort on a background thread; record_event
+# never raises, so a transfer or hang-up can't fail because of it.
+
+def _caller_last4(call: guava.Call) -> str | None:
+    number = getattr(call.call_info, "from_number", None)
+    return str(number)[-4:] if number else None
+
+
+def record_event(call: guava.Call, event_type: str, details: dict | None = None) -> None:
+    try:
+        client.record_call_event(call.id, event_type, details or {})
+    except Exception:  # noqa: BLE001 -- the dashboard must never affect the call
+        logger.exception("record_event(%s) failed", event_type)
+
+
+def build_handoff_context(call: guava.Call) -> dict:
+    """What the representative sees on pick-up. Deliberately never includes
+    the date of birth or the full caller phone number."""
+    collected = {
+        "loss_type": call.get_field("fnol_loss_type"),
+        "loss_location": call.get_field("fnol_loss_location"),
+        "loss_at": call.get_field("fnol_loss_at"),
+        "injuries": call.get_field("fnol_injuries"),
+        "drivable": call.get_field("fnol_drivable"),
+    }
+    context = {
+        "desk": call.get_variable("flow"),
+        "reason": call.get_variable("call_transfer_reason"),
+        "verified": call.get_variable("call_verified_dob") is not None,
+        "name": call.get_variable("fnol_policyholder_name"),
+        "policy_number": call.get_variable("fnol_policy_number"),
+        "claim_number": call.get_variable("call_claim_number") or call.get_variable("status_claim_number"),
+        "caller_last4": _caller_last4(call),
+        "last_request": call.get_variable("call_last_request"),
+        "collected": {k: v for k, v in collected.items() if v is not None},
+    }
+    return {k: v for k, v in context.items() if v is not None and v != {}}
+
+
+def follow_up_for(call: guava.Call, outcome: str) -> str | None:
+    """What, if anything, a Mercury person should do after this call."""
+    reason = call.get_variable("call_transfer_reason") or ""
+    claim = call.get_variable("call_claim_number")
+    if reason == "injury_reported":
+        return f"Injury flagged: partial claim {claim} saved, caller was transferred"
+    if outcome == "claim_created" and reason == "tow_request_failed":
+        return f"Arrange a tow for claim {claim}: the request failed during the call"
+    if outcome == "claim_created":
+        return f"Assign an adjuster to new claim {claim}"
+    if outcome == "error" and reason == "claim_submit_failed":
+        return "Claim NOT filed (system issue): details were collected, call the customer back"
+    if outcome == "abandoned" and call.get_variable("call_verified_dob") is not None:
+        return "Caller verified identity then hung up mid-call: consider a callback"
+    return None
+
+
 def transfer_to_human(call: guava.Call, instructions: str = copy.TRANSFER_GENERIC) -> None:
+    record_event(call, "transfer", build_handoff_context(call))
     call.transfer(destination=config.HUMAN_LINE_NUMBER, instructions=instructions)
+
+
+def transfer_to_roadside(call: guava.Call, instructions: str) -> None:
+    record_event(call, "transfer", build_handoff_context(call))
+    call.transfer(destination=config.ROADSIDE_LINE_NUMBER, instructions=instructions)
 
 
 # --- Shared handoff infrastructure (section 8.5: handoff rules in code) ---
@@ -251,6 +318,7 @@ _ROUTE_PURPOSE_FIELD = guava.Field(
 
 @agent.on_call_start
 def on_call_start(call: guava.Call) -> None:
+    record_event(call, "call_started", {"caller_last4": _caller_last4(call)})
     call.read_script(copy.OPENING_DISCLOSURE)
     call.set_task(
         ROUTE_TASK,
@@ -305,6 +373,7 @@ def on_route_complete(call: guava.Call) -> None:
 
 @agent.on_question
 def on_question(call: guava.Call, question: str) -> str:
+    call.set_variable("call_last_request", question)   # shown to the rep on hand-off
     handlers = _current_flow(call)
     if handlers and handlers.handle_question:
         return handlers.handle_question(call, question)
@@ -313,6 +382,7 @@ def on_question(call: guava.Call, question: str) -> str:
 
 @agent.on_action_request
 def on_action_request(call: guava.Call, intent_summary: str):
+    call.set_variable("call_last_request", intent_summary)   # shown to the rep on hand-off
     handlers = _current_flow(call)
     if handlers and handlers.classify_intent:
         return handlers.classify_intent(intent_summary)
@@ -374,6 +444,7 @@ def switch_flow(call: guava.Call, flow_name: str) -> None:
     # transfer for no reason the caller would understand.
     call.set_variable("handoff_reason", None)
     call.set_variable("flow", flow_name)
+    record_event(call, "desk", {"desk": flow_name})
     _flows[flow_name].start(call)
 
 
@@ -458,6 +529,17 @@ def on_session_end(call: guava.Call, event: BotSessionEnded) -> None:
         outcome=outcome,
         transfer_reason=call.get_variable("call_transfer_reason"),
         claim_number=summary.get("claim_number") or call.get_variable("call_claim_number"),
+    )
+
+    record_event(
+        call,
+        "call_ended",
+        {
+            "outcome": outcome,
+            "transfer_reason": call.get_variable("call_transfer_reason"),
+            "claim_number": call.get_variable("call_claim_number"),
+            "follow_up": follow_up_for(call, outcome),
+        },
     )
 
     logger.info(

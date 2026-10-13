@@ -22,6 +22,7 @@ from .agent import (
     register_flow,
     set_outcome,
     transfer_to_human,
+    transfer_to_roadside,
 )
 from .agent import agent as _agent
 
@@ -137,8 +138,8 @@ def _on_tow_intent_complete(call: guava.Call) -> None:
         # H11: real dispatch is out of scope here -- hand off to the
         # roadside line.
         set_outcome(call, "transferred", transfer_reason="roadside_dispatch_needed")
-        call.transfer(
-            destination=config.ROADSIDE_LINE_NUMBER,
+        transfer_to_roadside(
+            call,
             instructions=(
                 "Let the caller know you're connecting them with roadside dispatch now to get a "
                 "tow sent out."

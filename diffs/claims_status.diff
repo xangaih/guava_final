@@ -1,6 +1,6 @@
 --- originals/claims_status/__main__.py	2026-10-05 09:47:18
-+++ mercury_claims/status_flow.py	2026-10-13 13:03:53
-@@ -1,358 +1,355 @@
++++ mercury_claims/status_flow.py	2026-10-13 13:17:53
+@@ -1,358 +1,357 @@
 -# SDK conformance: guava-sdk 0.44.0 (2026-09-15)
 -import argparse
 -import json
@@ -39,6 +39,7 @@
 +    end_call_with_wrapup,
 +    is_claim_history_question,
 +    needs_handoff,
++    record_event,
 +    register_flow,
 +    set_outcome,
 +    transfer_to_human,
@@ -513,6 +514,7 @@
 +        case Ok(value):
 +            call.set_variable("status_claim_number", claim_number)
 +            call.set_variable("call_verified_dob", dob.isoformat())
++            record_event(call, "verified", {"claim_number": claim_number})
 +            _deliver_status(call, value.status, value.adjuster_name, value.adjuster_phone)
 +        case NotFound():
 +            # Same shape whether the claim doesn't exist or the DOB/ZIP

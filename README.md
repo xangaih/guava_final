@@ -152,6 +152,15 @@ helps on a noisy roadside call. An SMS claim-number confirmation is built behind
 the sandbox number isn't provisioned for SMS (carrier registration), and I won't claim a text was
 sent without proving it lands.
 
+**Rep desk (added after the interview).** A page at `/rep` on the backend that simulates what a
+Mercury representative would see: calls in progress, a screen pop with the hand-off context on every
+transfer (who, verified or not, which desk, why, what was collected, what the caller last asked),
+and a follow-up queue after calls end ("assign an adjuster to CLM-…", "injury flagged", "claim NOT
+filed, call the customer back"). The agent posts events on a background thread that never raises,
+so the dashboard can never slow or break a call. Honest limit: a real contact center attaches this
+context to the transferred call itself; here the page matches by call, and it's localhost-only with
+no login.
+
 ## Tailored to Mercury
 
 Everything below comes from Mercury's public site, written in my own words:
@@ -294,7 +303,8 @@ SQL editor or `supabase db push`).
 .venv/bin/python -m mercury_claims --phone            # the agent, on GUAVA_AGENT_NUMBER
 ```
 
-Then call the agent's number. Fake test data:
+Open the rep desk at `http://127.0.0.1:8000/rep` (it refreshes every 2 seconds). Then call the
+agent's number. Fake test data:
 
 | Use | Enter |
 |---|---|
@@ -386,12 +396,13 @@ other examples.
 
 In priority order:
 
-1. **Warm hand-off with context.** Transfers already work end to end (tested: it rang a second
-   phone). Next, the live agent should receive what the caller already said (who they are, verified
-   or not, which desk, what they asked for), so the person never has to start over.
-2. **Notify Mercury after the call.** When the agent says "a representative will follow up", someone
-   should actually be told. A post-call event to the claims team (claim filed, needs assignment,
-   injury flagged) closes that loop.
+1. **Warm hand-off with context.** *Done after the interview (see "Rep desk" above):* every
+   transfer now posts who the caller is, whether they're verified, which desk, why, what was
+   collected and what they last asked. Still open: attaching that context to the transferred call
+   itself instead of a page the rep matches by call.
+2. **Notify Mercury after the call.** *Done after the interview:* each call ends with a follow-up
+   on the rep desk (assign an adjuster, injury flagged, claim not filed, abandoned after verifying).
+   Still open: pushing those into Mercury's real queue rather than a page.
 3. **Mercury's other claim types.** Home and mechanical protection, as new desks on the same spine.
 4. **SMS mid-call.** The send path works; it's blocked on number provisioning. Send the claim number
    by text, and use a one-time code for identity.
@@ -501,3 +512,15 @@ the matching stretch of the recording is silenced; a transcript reader should ne
 birthday. Rejected: marking every field sensitive (transcripts become useless for debugging; the
 accident description is what an adjuster needs to read). Trade-off accepted: when an identity
 lookup fails, the transcript no longer shows what the caller said, so debugging those is harder.
+
+**Rep desk: hand-off context and post-call follow-ups**
+What: a `call_events` table and three backend routes (`POST /call-events`, `GET /rep/events`,
+`GET /rep`, a single plain-HTML page polling every 2 s). The agent posts `call_started`, `desk`,
+`verified`, `transfer` (with `build_handoff_context`) and `call_ended` (with `follow_up_for`).
+The roadside transfer now goes through `transfer_to_roadside` so it carries context too. Why:
+items 1 and 2 of the next-8-hours list; a caller who is handed to a person should never start over,
+and "a representative will follow up" should put something in someone's queue. Rejected: Server-Sent
+Events (polling is simpler and plenty for a demo); sending events synchronously (a dashboard outage
+would then delay a transfer, so they go on a background thread that never raises); a login on the
+page (localhost-only for now). Never sent: the date of birth or the full caller phone number, and
+a test asserts that.
