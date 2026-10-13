@@ -198,11 +198,18 @@ def _set_identity_task(call: guava.Call, *, retry_note: str | None = None) -> No
             ),
             field_type="digit_sequence",
             required=True,
+            sensitive=True,
         )
     )
     if not verified_dob:
         checklist.append(
-            guava.Field(key="status_dob", description="The claimant's date of birth, for identity verification", field_type="date", required=True)
+            guava.Field(
+                key="status_dob",
+                description="The claimant's date of birth, for identity verification",
+                field_type="date",
+                required=True,
+                sensitive=True,
+            )
         )
     checklist.append(
         guava.Field(
@@ -210,6 +217,7 @@ def _set_identity_task(call: guava.Call, *, retry_note: str | None = None) -> No
             description="The ZIP code on file for the policy. The caller may say the digits or enter them on their phone's keypad.",
             field_type="digit_sequence",
             required=True,
+            sensitive=True,
         )
     )
     call.set_task("status_identity", objective=objective, checklist=checklist)

@@ -84,6 +84,23 @@ def test_identity_retry_still_works_after_start_reset(monkeypatch):
 
 # --- DOB carry-over within one call ---
 
+def _sensitive_keys(call: MockCall) -> set[str]:
+    return {item.key for item in _last_task(call).action_items if getattr(item, "sensitive", False)}
+
+
+def test_identity_fields_are_marked_sensitive_on_a_fresh_call():
+    call = _call()
+    status_flow.start(call)
+    assert _sensitive_keys(call) == {"status_claim_number_digits", "status_dob", "status_zip"}
+
+
+def test_identity_fields_stay_sensitive_when_dob_is_carried_over():
+    call = _call()
+    call.set_variable("call_verified_dob", "1988-04-12")
+    status_flow.start(call)
+    assert _sensitive_keys(call) == {"status_claim_number_digits", "status_zip"}
+
+
 def test_fresh_call_asks_for_all_three_identity_fields():
     call = _call()
     status_flow.start(call)

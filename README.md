@@ -265,7 +265,10 @@ Honest list, so you see them here first:
   numbers or dates of birth, and my own end-of-call log line is redacted. But Guava's SDK logs the
   caller's phone number on every incoming call, along with the text of questions and requests, and
   the backend log includes ZIP codes. Production would filter those log lines and keep app logs
-  short-lived.
+  short-lived. On the Guava side, the five identity fields (policy number, claim number, date of
+  birth, ZIP) are now marked `sensitive`, which per Guava's Field docs removes them from stored
+  transcripts and silences them in the recording. Not yet confirmed on a live call (keypad entry
+  and the transcript redaction still need one test call).
 
 ## How to run it
 
@@ -490,3 +493,11 @@ backend still checks every lookup); "how many claims do I have?" answered honest
 correcting a single field on "no" (I didn't find a way to change one collected value in place, so
 a full re-ask was the safe option); broadening the towing guard to price questions (it would have blocked the FAQ from
 answering them); skipping re-verification across *calls* (never, only within one).
+
+**Identity fields marked sensitive**
+What: `sensitive=True` on the five identity fields (policy digits, date of birth on both desks, claim
+digits, ZIP). Why: Guava's Field docs say a sensitive value is removed from stored transcripts and
+the matching stretch of the recording is silenced; a transcript reader should never see a caller's
+birthday. Rejected: marking every field sensitive (transcripts become useless for debugging; the
+accident description is what an adjuster needs to read). Trade-off accepted: when an identity
+lookup fails, the transcript no longer shows what the caller said, so debugging those is harder.

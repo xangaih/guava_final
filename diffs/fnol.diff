@@ -1,6 +1,6 @@
 --- originals/fnol/__main__.py	2026-10-05 09:47:18
-+++ mercury_claims/fnol_flow.py	2026-10-06 11:40:42
-@@ -1,186 +1,514 @@
++++ mercury_claims/fnol_flow.py	2026-10-13 13:03:53
+@@ -1,186 +1,516 @@
 -# SDK conformance: guava-sdk 0.44.0 (2026-09-15)
 -import argparse
 -import json
@@ -292,6 +292,7 @@
              ),
 +            field_type="digit_sequence",
 +            required=True,
++            sensitive=True,
 +        ),
 +    ]
 +    if not verified_dob:
@@ -313,6 +314,7 @@
 -            ),
 -        ],
 -    )
++                sensitive=True,
 +            )
 +        )
 +    call.set_task("fnol_identity", objective=objective, checklist=checklist)
@@ -657,7 +659,7 @@
                  field_type="multiple_choice",
                  choices=["yes", "no"],
                  required=True,
-@@ -189,286 +517,313 @@
+@@ -189,286 +519,313 @@
      )
  
  

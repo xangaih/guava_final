@@ -216,6 +216,7 @@ def _set_identity_task(call: guava.Call, *, retry_note: str | None = None) -> No
             ),
             field_type="digit_sequence",
             required=True,
+            sensitive=True,
         ),
     ]
     if not verified_dob:
@@ -225,6 +226,7 @@ def _set_identity_task(call: guava.Call, *, retry_note: str | None = None) -> No
                 description="The caller's date of birth, for identity verification",
                 field_type="date",
                 required=True,
+                sensitive=True,
             )
         )
     call.set_task("fnol_identity", objective=objective, checklist=checklist)

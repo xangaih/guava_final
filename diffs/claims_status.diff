@@ -1,6 +1,6 @@
 --- originals/claims_status/__main__.py	2026-10-05 09:47:18
-+++ mercury_claims/status_flow.py	2026-10-06 11:40:42
-@@ -1,358 +1,347 @@
++++ mercury_claims/status_flow.py	2026-10-13 13:03:53
+@@ -1,358 +1,355 @@
 -# SDK conformance: guava-sdk 0.44.0 (2026-09-15)
 -import argparse
 -import json
@@ -263,14 +263,7 @@
 -                "Acknowledge their request. Let them know they will not be contacted "
 -                "again by phone, and that any future updates will be sent by mail, "
 -                "and politely say goodbye."
--            )
--        )
--    elif outcome == "wrong_number":
--        logging.info("Wrong number for %s.", contact_name)
--        call.hangup(final_instructions="Apologize for the mistake and wish them well, and politely say goodbye.")
-     else:
--        logging.info("Could not reach %s (outcome: %s).", contact_name, outcome)
--        call.hangup()
++    else:
 +        objective = (
 +            "Verify the caller's identity before sharing any claim details. Collect their claim "
 +            "number, date of birth, and ZIP code on file. The claim number is on any confirmation "
@@ -286,7 +279,23 @@
 +        )
 +    if retry_note:
 +        objective = f"{retry_note} {objective}"
- 
++
++    checklist: list = []
++    if just_filed:
++        checklist.append(
++            guava.Say(
++                f"Would you like to check the claim we just filed, {just_filed}, or a different "
++                f"one? For a different one, you can say the digits after CLM-dash or enter them "
++                f"on your phone's keypad."
+             )
+         )
+-    elif outcome == "wrong_number":
+-        logging.info("Wrong number for %s.", contact_name)
+-        call.hangup(final_instructions="Apologize for the mistake and wish them well, and politely say goodbye.")
+     else:
+-        logging.info("Could not reach %s (outcome: %s).", contact_name, outcome)
+-        call.hangup()
+-
 -
 -@agent.on_task_complete("verify_identity")
 -def on_identity_verified(call: guava.Call) -> None:
@@ -302,13 +311,13 @@
 -                "for this claim. For security, you cannot share claim details. "
 -                "Suggest they call the main claims line at 1-800-555-0100 with their "
 -                "policy documents handy, and politely say goodbye."
-+    checklist: list = []
-+    if just_filed:
 +        checklist.append(
 +            guava.Say(
-+                f"Would you like to check the claim we just filed, {just_filed}, or a different "
-+                f"one? For a different one, you can say the digits after CLM-dash or enter them "
-+                f"on your phone's keypad."
++                "I can help you check on another claim. I'll just need the claim number and ZIP "
++                "code."
++                if verified_dob
++                else "I can help you check on an existing claim. First, I need to verify your "
++                "identity."
              )
          )
 -        return
@@ -350,14 +359,10 @@
 -                    required=True,
 -                ),
 -            ],
-+    else:
 +        checklist.append(
 +            guava.Say(
-+                "I can help you check on another claim. I'll just need the claim number and ZIP "
-+                "code."
-+                if verified_dob
-+                else "I can help you check on an existing claim. First, I need to verify your "
-+                "identity."
++                "Could you give me your claim number? You can say the digits after CLM-dash, or "
++                "enter them on your phone's keypad -- whichever's easier."
 +            )
          )
 -    elif claim["status"] == "pending":
@@ -368,7 +373,14 @@
 -                f"The claim is pending. Explain what is being waited on and the expected "
 -                f"timeline. Ask if they have any additional documentation to submit. "
 -                f"Do NOT predict when the claim will be resolved or estimate a payout amount."
--            ),
++    checklist.append(
++        guava.Field(
++            key="status_claim_number_digits",
++            description=(
++                "The 7 digits after 'CLM-' in the caller's claim number. The prefix is "
++                "always CLM- and is not collected here. The caller may say the digits or "
++                "enter them on their phone's keypad."
+             ),
 -            checklist=[
 -                guava.Field(
 -                    key="status_understood",
@@ -384,11 +396,9 @@
 -                    required=True,
 -                ),
 -            ],
-+        checklist.append(
-+            guava.Say(
-+                "Could you give me your claim number? You can say the digits after CLM-dash, or "
-+                "enter them on your phone's keypad -- whichever's easier."
-+            )
++            field_type="digit_sequence",
++            required=True,
++            sensitive=True,
          )
 -    else:
 -        call.set_task(
@@ -398,14 +408,7 @@
 -                f"The claim has been approved. Share the settlement details and timeline. "
 -                f"Ask if they have a preferred repair vendor. "
 -                f"Do NOT modify the settlement amount or make promises beyond what is stated."
-+    checklist.append(
-+        guava.Field(
-+            key="status_claim_number_digits",
-+            description=(
-+                "The 7 digits after 'CLM-' in the caller's claim number. The prefix is "
-+                "always CLM- and is not collected here. The caller may say the digits or "
-+                "enter them on their phone's keypad."
-             ),
+-            ),
 -            checklist=[
 -                guava.Field(
 -                    key="status_understood",
@@ -420,20 +423,24 @@
 -                    required=False,
 -                ),
 -            ],
-+            field_type="digit_sequence",
-+            required=True,
-         )
 +    )
 +    if not verified_dob:
 +        checklist.append(
-+            guava.Field(key="status_dob", description="The claimant's date of birth, for identity verification", field_type="date", required=True)
-+        )
++            guava.Field(
++                key="status_dob",
++                description="The claimant's date of birth, for identity verification",
++                field_type="date",
++                required=True,
++                sensitive=True,
++            )
+         )
 +    checklist.append(
 +        guava.Field(
 +            key="status_zip",
 +            description="The ZIP code on file for the policy. The caller may say the digits or enter them on their phone's keypad.",
 +            field_type="digit_sequence",
 +            required=True,
++            sensitive=True,
 +        )
 +    )
 +    call.set_task("status_identity", objective=objective, checklist=checklist)

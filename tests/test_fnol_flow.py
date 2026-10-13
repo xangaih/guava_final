@@ -510,6 +510,26 @@ def _field_keys(call: MockCall) -> list[str]:
     return [item.key for item in _tasks(call)[-1].action_items if item.key.startswith("fnol_")]
 
 
+def _sensitive_keys(call: MockCall) -> set[str]:
+    return {item.key for item in _tasks(call)[-1].action_items if getattr(item, "sensitive", False)}
+
+
+def test_identity_fields_are_marked_sensitive_on_a_fresh_call():
+    # sensitive=True asks Guava to strip the value from stored transcripts
+    # and silence it in the recording (Field docs). Identity values are the
+    # only ones the caller speaks that a transcript reader should never see.
+    call = _call()
+    fnol_flow.start(call)
+    assert _sensitive_keys(call) == {"fnol_policy_number_digits", "fnol_dob"}
+
+
+def test_identity_fields_stay_sensitive_when_dob_is_carried_over():
+    call = _call()
+    call.set_variable("call_verified_dob", "1988-04-12")
+    fnol_flow.start(call)
+    assert _sensitive_keys(call) == {"fnol_policy_number_digits"}
+
+
 def test_fresh_call_asks_for_policy_number_and_dob():
     call = _call()
     fnol_flow.start(call)
