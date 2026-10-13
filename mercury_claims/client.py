@@ -17,6 +17,7 @@ from . import config
 from .models import (
     ClaimCreated,
     ClaimStatus,
+    Locked,
     Malformed,
     NotFound,
     Ok,
@@ -58,6 +59,10 @@ class Client:
 
             if resp.status_code == 404:
                 return NotFound()
+            if resp.status_code == 423:
+                # Identity lockout. Checked before the generic 4xx branch so
+                # it can't be reported to the caller as "systems are down".
+                return Locked()
             if resp.status_code >= 500:
                 if attempt < 2:
                     logger.warning("%s: HTTP %d on attempt %d, retrying", path, resp.status_code, attempt)
@@ -81,10 +86,10 @@ class Client:
                 logger.error("%s: response body did not match the expected shape", path)
                 return Malformed(reason="schema_mismatch")
 
-    def verify_policy(self, policy_number: str, dob: date) -> Result:
+    def verify_policy(self, policy_number: str, dob: date, caller_phone: str | None = None) -> Result:
         return self._request(
             "/policies/verify",
-            {"policy_number": policy_number, "dob": dob.isoformat()},
+            {"policy_number": policy_number, "dob": dob.isoformat(), "caller_phone": caller_phone},
             PolicyVerification,
         )
 
@@ -122,10 +127,10 @@ class Client:
         }
         return self._request("/claims", payload, ClaimCreated)
 
-    def lookup_claim(self, claim_number: str, dob: date, zip_code: str) -> Result:
+    def lookup_claim(self, claim_number: str, dob: date, zip_code: str, caller_phone: str | None = None) -> Result:
         return self._request(
             "/claims/lookup",
-            {"claim_number": claim_number, "dob": dob.isoformat(), "zip": zip_code},
+            {"claim_number": claim_number, "dob": dob.isoformat(), "zip": zip_code, "caller_phone": caller_phone},
             ClaimStatus,
         )
 
@@ -156,6 +161,7 @@ class Client:
         transfer_reason: str | None = None,
         claim_number: str | None = None,
         api_errors: list | None = None,
+        phone_match: bool | None = None,
     ) -> None:
         """Best-effort audit write. Never raises: a failed audit write
         must never be fatal to the call, so this only logs."""
@@ -169,6 +175,7 @@ class Client:
                     "transfer_reason": transfer_reason,
                     "claim_number": claim_number,
                     "api_errors": api_errors or [],
+                    "phone_match": phone_match,
                 },
             )
             if resp.status_code >= 400:

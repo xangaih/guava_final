@@ -161,6 +161,15 @@ so the dashboard can never slow or break a call. Honest limit: a real contact ce
 context to the transferred call itself; here the page matches by call, and it's localhost-only with
 no login.
 
+**Stronger identity (added after the interview).** Two things, both decided by the backend because
+only it sees every call. (1) The caller's number is compared to the phone on the policy and the
+result travels as a flag to the rep desk and the audit row; it is a signal, not a gate, because
+people call from work phones and family phones, and the caller never hears about it. (2) A lockout
+across calls: five failed identity attempts within 30 minutes for the same policy or claim, or from
+the same phone, lock identity for 30 minutes. A locked caller isn't told the rule and isn't blocked;
+they hear "for your security, let me connect you with a representative" and reach a person. The
+caller's number is stored only as a hash.
+
 ## Tailored to Mercury
 
 Everything below comes from Mercury's public site, written in my own words:
@@ -324,6 +333,15 @@ curl -X POST http://127.0.0.1:8000/admin/fault \
 
 Modes: `timeout`, `slow`, `500`, `malformed`, `not_found`, `none`.
 
+**Locked yourself out** (practising the wrong-birthday path five times does it):
+
+```bash
+curl -X POST http://127.0.0.1:8000/admin/reset-lockouts -H "X-Admin-Token: <ADMIN_TOKEN from .env>"
+```
+
+To see the "number on file ✓" badge on the rep desk, set one test policy's `phone` in Supabase to
+the phone you'll demo from (the seed data uses fake numbers).
+
 **Tests and checks:**
 
 ```bash
@@ -408,7 +426,11 @@ In priority order:
    by text, and use a one-time code for identity.
 5. **Measure latency** and add a "let me look that up" line before backend calls; cut the worst-case
    wait.
-6. **Stronger identity:** caller ID vs the phone on the policy, lockout across calls.
+6. **Stronger identity.** *Done after the interview (see "Stronger identity" above):* the caller's
+   number is compared to the phone on the policy (a flag for the rep and the audit row, not a
+   gate), and five failed attempts in 30 minutes for the same policy/claim or from the same phone
+   lock identity for 30 minutes, which the caller experiences as a transfer "for your security".
+   Still open: a one-time code to the phone on file.
 7. **Live-verify** the prompt-level fixes listed under rough edges.
 
 ## Time spent
@@ -524,3 +546,15 @@ Events (polling is simpler and plenty for a demo); sending events synchronously 
 would then delay a transfer, so they go on a background thread that never raises); a login on the
 page (localhost-only for now). Never sent: the date of birth or the full caller phone number, and
 a test asserts that.
+
+**Stronger identity: caller-phone flag and cross-call lockout**
+What: an `auth_attempts` table and a `phone_match` column on `call_sessions`; the identity
+endpoints take the caller's number, count attempts, return 423 when locked, and compare the number
+to the one on file; a new `Locked` result type in the client (423 is matched before the generic 4xx
+branch, so it can never be reported as "systems are down"); both desks transfer with a security
+line on `Locked`; `POST /admin/reset-lockouts` for demos. Why: anyone who knew a policy number and
+birthday could hang up and retry forever. Rejected: an extra question on a phone mismatch (flag
+only, your call: people legitimately call from other phones); a hard block when locked (an attacker
+could lock a real customer out on purpose, so "locked" means "a person checks you"); storing the
+caller's number (a hash is enough to count repeats). Not verified live yet: the lockout itself and
+the badge.

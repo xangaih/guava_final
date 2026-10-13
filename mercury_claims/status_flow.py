@@ -21,6 +21,7 @@ from .agent import (
     FlowHandlers,
     as_date,
     bounded_validate,
+    caller_phone,
     end_call_with_wrapup,
     is_claim_history_question,
     needs_handoff,
@@ -31,7 +32,7 @@ from .agent import (
 )
 from .agent import agent as _agent
 from .client import client
-from .models import Malformed, NotFound, Ok, Unavailable
+from .models import Locked, Malformed, NotFound, Ok, Unavailable
 
 # Named (not inline) so a test can check every desk offers the moves it
 # needs. Confirmed live (2026-10-06): "check ANOTHER claim" had no move on
@@ -249,7 +250,7 @@ def _on_identity_complete(call: guava.Call) -> None:
         transfer_to_human(call, instructions=copy.TRANSFER_BACKEND_DOWN)
         return
     zip_code = call.get_field("status_zip")
-    result = client.lookup_claim(claim_number, dob, zip_code)
+    result = client.lookup_claim(claim_number, dob, zip_code, caller_phone=caller_phone(call))
 
     attempts = call.get_variable("status_identity_attempts", 0) + 1
     call.set_variable("status_identity_attempts", attempts)
@@ -258,8 +259,14 @@ def _on_identity_complete(call: guava.Call) -> None:
         case Ok(value):
             call.set_variable("status_claim_number", claim_number)
             call.set_variable("call_verified_dob", dob.isoformat())
-            record_event(call, "verified", {"claim_number": claim_number})
+            call.set_variable("call_phone_match", value.phone_match)
+            record_event(call, "verified", {"claim_number": claim_number, "phone_match": value.phone_match})
             _deliver_status(call, value.status, value.adjuster_name, value.adjuster_phone)
+        case Locked():
+            # See fnol_flow: a cross-call lockout is a transfer, never a
+            # retry and never "systems are down".
+            set_outcome(call, "transferred", transfer_reason="identity_locked")
+            transfer_to_human(call, instructions=copy.TRANSFER_IDENTITY_LOCKED)
         case NotFound():
             # Same shape whether the claim doesn't exist or the DOB/ZIP
             # didn't match -- nothing is leaked about which was wrong.

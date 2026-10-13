@@ -132,7 +132,7 @@ def test_lookup_uses_the_carried_dob_and_a_success_stores_it(monkeypatch):
     call.set_field("status_zip", "90001")  # no status_dob field was collected
     seen = {}
 
-    def fake_lookup(claim_number, dob, zip_code):
+    def fake_lookup(claim_number, dob, zip_code, caller_phone=None):
         seen.update(claim_number=claim_number, dob=dob, zip_code=zip_code)
         return Ok(ClaimStatus(status="received"))
 

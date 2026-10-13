@@ -49,6 +49,7 @@ const REASON_LABEL = {
   dob_unparseable: ["SYSTEM ISSUE", "orange"],
   unrecognized_status: ["SYSTEM ISSUE", "orange"],
   identity_mismatch: ["IDENTITY FAILED", "yellow"],
+  identity_locked: ["IDENTITY LOCKED · security", "red"],
   validation_exhausted: ["STUCK CALLER", "yellow"],
   vehicle_details_unconfirmed: ["DETAILS UNCONFIRMED", "yellow"],
   status_denied: ["DENIED CLAIM", "red"],
@@ -72,6 +73,7 @@ function kv(pairs) {
   const rows = pairs.filter(([, v]) => v !== undefined && v !== null && v !== "").map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`);
   return rows.length ? `<dl class="kv">${rows.join("")}</dl>` : "";
 }
+function phoneLabel(m) { return m === true ? "✓ number on file" : m === false ? "⚠ calling from a different number" : undefined; }
 function fmtWhen(v) {
   if (v && typeof v === "object") { const p = n => String(n).padStart(2, "0"); return `${v.year}-${p(v.month)}-${p(v.day)}` + (v.hour != null ? ` ${p(v.hour)}:${p(v.minute ?? 0)}` : ""); }
   return v;
@@ -93,13 +95,15 @@ function render(events) {
   document.getElementById("live").innerHTML = live.length ? live.map(c => `
     <div class="card"><div class="top"><span class="badge green">IN PROGRESS</span><span class="when">${when(c.started)}</span></div>
     ${kv([["caller", c.last4 ? `••• ${c.last4}` : "hidden number"], ["desk", DESK_LABEL[c.desk] || "choosing"],
-          ["verified", c.verified ? (c.verified.name || c.verified.claim_number || "yes") : "not yet"]])}</div>`).join("")
+          ["verified", c.verified ? (c.verified.name || c.verified.claim_number || "yes") : "not yet"],
+          ["phone", c.verified ? phoneLabel(c.verified.phone_match) : undefined]])}</div>`).join("")
     : `<div class="empty">No calls in progress.</div>`;
 
   const transfers = events.filter(e => e.event_type === "transfer").slice(0, 20);
   document.getElementById("transfers").innerHTML = transfers.length ? transfers.map(e => { const d = e.details || {}, col = d.collected || {}; return `
     <div class="card"><div class="top">${badge(d.reason)}<span class="when">${when(e.created_at)}</span></div>
     ${kv([["caller", d.name || (d.caller_last4 ? `••• ${d.caller_last4}` : "")], ["identity", d.verified ? "verified ✓" : "NOT verified"],
+          ["phone", phoneLabel(d.phone_match)],
           ["policy", d.policy_number], ["claim", d.claim_number], ["desk", DESK_LABEL[d.desk] || d.desk],
           ["incident", col.loss_type], ["where", col.loss_location], ["when", fmtWhen(col.loss_at)],
           ["injuries", col.injuries], ["drivable", col.drivable]])}

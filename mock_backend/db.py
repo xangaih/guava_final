@@ -1,4 +1,5 @@
-from datetime import date, datetime
+import hashlib
+from datetime import date, datetime, timedelta, timezone
 
 from fastapi import HTTPException
 from postgrest.exceptions import APIError
@@ -45,13 +46,93 @@ def _compute_coverage_review(policy: dict, loss_at: datetime) -> tuple[bool, str
     return False, None
 
 
-def verify_policy(policy_number: str, dob: date) -> PolicyVerifyResponse:
+# --- Identity: lockout across calls, and the caller-phone signal ---
+#
+# The agent only sees one call; the backend sees all of them, so this is
+# where "5 failures in 30 minutes → locked for 30 minutes" lives. A lock
+# means HTTP 423, which the agent turns into "for your security, let me
+# connect you with a representative" -- never "you're locked out", and
+# never a hard block, because an attacker could otherwise lock a real
+# customer out on purpose. The caller's number is stored only as a hash.
+
+LOCKOUT_FAILURES = 5
+LOCKOUT_WINDOW = timedelta(minutes=30)
+
+
+def _digits(phone: str | None) -> str:
+    return "".join(ch for ch in (phone or "") if ch.isdigit())
+
+
+def phone_hash(phone: str | None) -> str | None:
+    digits = _digits(phone)
+    return hashlib.sha256(digits.encode()).hexdigest() if digits else None
+
+
+def phone_match(on_file: str | None, caller: str | None) -> bool | None:
+    """None when either side is unknown; otherwise compare the last 10
+    digits so +1 prefixes and formatting don't matter."""
+    a, b = _digits(on_file)[-10:], _digits(caller)[-10:]
+    if not a or not b:
+        return None
+    return a == b
+
+
+def _recent_failures(column: str, value: str) -> int:
+    since = (datetime.now(timezone.utc) - LOCKOUT_WINDOW).isoformat()
+    rows = (
+        get_client()
+        .table("auth_attempts")
+        .select("success")
+        .eq(column, value)
+        .gte("created_at", since)
+        .order("created_at", desc=True)
+        .execute()
+        .data
+    )
+    failures = 0
+    for row in rows:  # newest first: a success resets the count
+        if row["success"]:
+            break
+        failures += 1
+    return failures
+
+
+def _is_locked(identifier: str, caller_hash: str | None) -> bool:
+    if _recent_failures("identifier", identifier) >= LOCKOUT_FAILURES:
+        return True
+    return bool(caller_hash) and _recent_failures("caller_phone_hash", caller_hash) >= LOCKOUT_FAILURES
+
+
+def _record_attempt(identifier: str, caller_hash: str | None, success: bool) -> None:
+    get_client().table("auth_attempts").insert(
+        {"identifier": identifier, "caller_phone_hash": caller_hash, "success": success}
+    ).execute()
+
+
+def reset_lockouts() -> int:
+    # Demo convenience: practising the wrong-birthday path locks you out.
+    res = get_client().table("auth_attempts").delete().neq("identifier", "").execute()
+    return len(res.data or [])
+
+
+def verify_policy(policy_number: str, dob: date, caller_phone: str | None = None) -> PolicyVerifyResponse:
     client = get_client()
+    caller_hash = phone_hash(caller_phone)
+    if _is_locked(policy_number, caller_hash):
+        raise HTTPException(status_code=423, detail="too many failed attempts")
+
     res = client.table("policies").select("*").eq("policy_number", policy_number).limit(1).execute()
-    if not res.data or res.data[0]["dob"] != dob.isoformat():
+    success = bool(res.data) and res.data[0]["dob"] == dob.isoformat()
+    _record_attempt(policy_number, caller_hash, success)
+    if not success:
         return PolicyVerifyResponse(verified=False)
     policy = res.data[0]
-    return PolicyVerifyResponse(verified=True, holder_name=policy["holder_name"], status=policy["status"])
+    return PolicyVerifyResponse(
+        verified=True,
+        holder_name=policy["holder_name"],
+        status=policy["status"],
+        phone_match=phone_match(policy.get("phone"), caller_phone),
+    )
 
 
 def create_claim(payload: ClaimCreateRequest) -> ClaimCreateResponse:
@@ -110,25 +191,30 @@ def create_claim(payload: ClaimCreateRequest) -> ClaimCreateResponse:
 
 def lookup_claim(payload: ClaimLookupRequest) -> ClaimLookupResponse:
     client = get_client()
+    caller_hash = phone_hash(payload.caller_phone)
+    if _is_locked(payload.claim_number, caller_hash):
+        raise HTTPException(status_code=423, detail="too many failed attempts")
+
     res = (
         client.table("claims")
-        .select("*, policies(dob, zip)")
+        .select("*, policies(dob, zip, phone)")
         .eq("claim_number", payload.claim_number)
         .limit(1)
         .execute()
     )
     # A missing claim and a right-claim-wrong-DOB-or-ZIP look identical to
     # the caller: both come back as "not found" so nothing is leaked.
-    if not res.data:
-        raise HTTPException(status_code=404, detail="claim not found")
-    claim = res.data[0]
-    policy = claim.get("policies") or {}
-    if policy.get("dob") != payload.dob.isoformat() or policy.get("zip") != payload.zip:
+    claim = res.data[0] if res.data else None
+    policy = (claim or {}).get("policies") or {}
+    success = claim is not None and policy.get("dob") == payload.dob.isoformat() and policy.get("zip") == payload.zip
+    _record_attempt(payload.claim_number, caller_hash, success)
+    if not success:
         raise HTTPException(status_code=404, detail="claim not found")
     return ClaimLookupResponse(
         status=claim["status"],
         adjuster_name=claim.get("adjuster_name"),
         adjuster_phone=claim.get("adjuster_phone"),
+        phone_match=phone_match(policy.get("phone"), payload.caller_phone),
     )
 
 

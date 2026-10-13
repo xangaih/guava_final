@@ -79,7 +79,7 @@ def policies_verify(payload: PolicyVerifyRequest):
         db.truncate_policy_number(payload.policy_number),
         db.mask_dob(str(payload.dob)),
     )
-    return db.verify_policy(payload.policy_number, payload.dob)
+    return db.verify_policy(payload.policy_number, payload.dob, payload.caller_phone)
 
 
 @app.post("/claims", response_model=ClaimCreateResponse, dependencies=[Depends(require_api_key)])
@@ -158,6 +158,13 @@ _REP_PAGE = Path(__file__).parent / "static" / "rep.html"
 @app.get("/rep", include_in_schema=False)
 def rep_page():
     return FileResponse(_REP_PAGE)
+
+
+@app.post("/admin/reset-lockouts", dependencies=[Depends(require_admin_token)])
+def admin_reset_lockouts() -> dict:
+    cleared = db.reset_lockouts()
+    logger.info("lockouts reset: %d attempts cleared", cleared)
+    return {"cleared": cleared}
 
 
 @app.post("/admin/fault", dependencies=[Depends(require_admin_token)])

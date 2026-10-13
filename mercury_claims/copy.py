@@ -15,6 +15,16 @@ TRANSFER_GENERIC = (
     "and transfer the call."
 )
 
+# Identity lockout (too many failed attempts for this policy/claim, or from
+# this phone, across calls). Deliberately does not say "locked out": that
+# would tell an attacker the rule, and a real customer who got locked out
+# by someone else's attempts still reaches a person.
+TRANSFER_IDENTITY_LOCKED = (
+    "Let the caller know that, for their security, you're going to connect them with a "
+    "representative who can verify their identity and help them. Do not say why, do not "
+    "mention a lockout or a limit, and do not ask for their information again."
+)
+
 TRANSFER_BACKEND_DOWN = (
     "Let the caller know our systems are temporarily unavailable and you "
     "can't complete this right now. Apologize, and connect them with a "

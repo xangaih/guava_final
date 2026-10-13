@@ -26,6 +26,7 @@ from .agent import (
     as_date,
     as_datetime,
     bounded_validate,
+    caller_phone,
     end_call_with_wrapup,
     is_claim_history_question,
     needs_handoff,
@@ -36,7 +37,7 @@ from .agent import (
 )
 from .agent import agent as _agent
 from .client import client
-from .models import Malformed, NotFound, Ok, Unavailable
+from .models import Locked, Malformed, NotFound, Ok, Unavailable
 
 logger = logging.getLogger("mercury_claims.fnol_flow")
 
@@ -258,7 +259,7 @@ def _on_identity_complete(call: guava.Call) -> None:
         set_outcome(call, "error", transfer_reason="dob_unparseable")
         transfer_to_human(call, instructions=copy.TRANSFER_BACKEND_DOWN)
         return
-    result = client.verify_policy(policy_number, dob)
+    result = client.verify_policy(policy_number, dob, caller_phone=caller_phone(call))
 
     attempts = call.get_variable("fnol_identity_attempts", 0) + 1
     call.set_variable("fnol_identity_attempts", attempts)
@@ -268,7 +269,12 @@ def _on_identity_complete(call: guava.Call) -> None:
             call.set_variable("fnol_policy_number", policy_number)
             call.set_variable("fnol_policyholder_name", value.holder_name)
             call.set_variable("call_verified_dob", dob.isoformat())
-            record_event(call, "verified", {"name": value.holder_name, "policy_number": policy_number})
+            call.set_variable("call_phone_match", value.phone_match)
+            record_event(
+                call,
+                "verified",
+                {"name": value.holder_name, "policy_number": policy_number, "phone_match": value.phone_match},
+            )
             call.set_task(
                 "fnol_loss_basics",
                 objective=(
@@ -315,6 +321,13 @@ def _on_identity_complete(call: guava.Call) -> None:
                     ),
                 ],
             )
+        case Locked():
+            # Too many failed attempts across calls (backend decides).
+            # Matched before the catch-all branches on purpose: this is
+            # not "systems are down", and the caller gets a person, not a
+            # retry and not an explanation of the rule.
+            set_outcome(call, "transferred", transfer_reason="identity_locked")
+            transfer_to_human(call, instructions=copy.TRANSFER_IDENTITY_LOCKED)
         case Ok() | NotFound():
             # Same failure shape either way: wrong policy number or wrong
             # DOB look identical, so the caller can't learn which was

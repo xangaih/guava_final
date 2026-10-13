@@ -87,6 +87,13 @@ def _caller_last4(call: guava.Call) -> str | None:
     return str(number)[-4:] if number else None
 
 
+def caller_phone(call: guava.Call) -> str | None:
+    """The number the caller is calling from, or None (hidden number, web
+    call). Sent to the backend with identity checks, where it's compared to
+    the phone on file and counted for the cross-call lockout."""
+    return getattr(call.call_info, "from_number", None) or None
+
+
 def record_event(call: guava.Call, event_type: str, details: dict | None = None) -> None:
     try:
         client.record_call_event(call.id, event_type, details or {})
@@ -112,6 +119,7 @@ def build_handoff_context(call: guava.Call) -> dict:
         "policy_number": call.get_variable("fnol_policy_number"),
         "claim_number": call.get_variable("call_claim_number") or call.get_variable("status_claim_number"),
         "caller_last4": _caller_last4(call),
+        "phone_match": call.get_variable("call_phone_match"),
         "last_request": call.get_variable("call_last_request"),
         "collected": {k: v for k, v in collected.items() if v is not None},
     }
@@ -529,6 +537,7 @@ def on_session_end(call: guava.Call, event: BotSessionEnded) -> None:
         outcome=outcome,
         transfer_reason=call.get_variable("call_transfer_reason"),
         claim_number=summary.get("claim_number") or call.get_variable("call_claim_number"),
+        phone_match=call.get_variable("call_phone_match"),
     )
 
     record_event(

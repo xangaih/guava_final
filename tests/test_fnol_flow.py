@@ -551,7 +551,7 @@ def test_verification_uses_the_carried_dob_and_stores_it(monkeypatch):
     call.set_field("fnol_policy_number_digits", "100245")  # no fnol_dob collected
     seen = {}
 
-    def fake_verify(policy_number, dob):
+    def fake_verify(policy_number, dob, caller_phone=None):
         seen.update(policy_number=policy_number, dob=dob)
         return Ok(PolicyVerification(verified=True, holder_name="Jordan Alvarez", status="active"))
 

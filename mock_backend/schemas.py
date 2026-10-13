@@ -7,6 +7,9 @@ from pydantic import BaseModel, Field
 class PolicyVerifyRequest(BaseModel):
     policy_number: str
     dob: date
+    # The number the caller is calling from, if known. Compared to the
+    # policy's phone on file; the phone on file is never returned.
+    caller_phone: str | None = None
 
 
 class PolicyVerifyResponse(BaseModel):
@@ -15,6 +18,7 @@ class PolicyVerifyResponse(BaseModel):
     verified: bool
     holder_name: str | None = None
     status: str | None = None
+    phone_match: bool | None = None
 
 
 class ClaimCreateRequest(BaseModel):
@@ -43,12 +47,14 @@ class ClaimLookupRequest(BaseModel):
     claim_number: str
     dob: date
     zip: str
+    caller_phone: str | None = None
 
 
 class ClaimLookupResponse(BaseModel):
     status: str
     adjuster_name: str | None = None
     adjuster_phone: str | None = None
+    phone_match: bool | None = None
 
 
 class TowRequestCreate(BaseModel):
@@ -77,6 +83,7 @@ class CallSessionCreate(BaseModel):
     transfer_reason: str | None = None
     claim_number: str | None = None
     api_errors: list = Field(default_factory=list)
+    phone_match: bool | None = None
 
 
 class CallEventCreate(BaseModel):

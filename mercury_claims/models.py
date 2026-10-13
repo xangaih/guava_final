@@ -38,13 +38,24 @@ class Malformed:
     reason: str
 
 
-Result = Ok[T] | NotFound | Unavailable | Malformed
+@dataclass(frozen=True)
+class Locked:
+    """Too many failed identity attempts for this policy/claim or from this
+    phone (HTTP 423). Its own type so a flow can't mistake it for "systems
+    are down": the honest response is a transfer, not an apology."""
+
+
+Result = Ok[T] | NotFound | Unavailable | Malformed | Locked
 
 
 class PolicyVerification(BaseModel):
     verified: bool
     holder_name: str | None = None
     status: str | None = None
+    # True/False: caller's number vs the one on the policy. None: unknown
+    # (hidden number, web call). A signal for the rep and the audit row,
+    # not a gate -- people call from work phones and family phones.
+    phone_match: bool | None = None
 
 
 class ClaimCreated(BaseModel):
@@ -55,6 +66,7 @@ class ClaimStatus(BaseModel):
     status: str
     adjuster_name: str | None = None
     adjuster_phone: str | None = None
+    phone_match: bool | None = None
 
 
 class TowDispatched(BaseModel):
