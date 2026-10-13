@@ -15,6 +15,48 @@ backed by Supabase Postgres) and uses what comes back in the conversation.
 
 ---
 
+## Changed since the submission
+
+The version that was reviewed is the git tag **`submission`** on `main` (commit `56d7380`). Everything
+in this section was added afterwards, on the **`post-interview`** branch, in three commits. The
+agent's spoken behavior is unchanged except for one new line (the lockout transfer below); the
+rest is what Mercury's people would see and what the system records.
+
+1. **Identity fields marked sensitive.** Policy number, claim number, date of birth and ZIP carry
+   `sensitive=True`, which per Guava's Field docs removes them from stored transcripts and silences
+   them in the recording. Not yet confirmed on a live call.
+2. **The rep desk** at `http://127.0.0.1:8000/rep`. A page that **simulates what a Mercury claims
+   representative would see**, kept up to date by polling the backend every 2 seconds:
+   - **Live calls:** each call in progress, with the last 4 digits of the caller's number, which
+     desk they're at, and their name once identity is verified.
+   - **Transfers (screen pop):** on every hand-off to a person, why (injury, system down, denied
+     claim, asked for a person, needs a tow now…), who, verified or not, policy or claim number,
+     what was collected so far, and what the caller last asked, so the caller never has to start
+     over.
+   - **Follow-up queue:** after each call, what someone at Mercury should do next ("assign an
+     adjuster to CLM-…", "injury flagged", "claim NOT filed, call the customer back", "verified
+     then hung up, consider a callback").
+
+   Never shown: a date of birth or a full phone number. The agent posts these events on a
+   background thread that never raises, so the dashboard can never slow or break a call. It is
+   localhost-only with no login, and it is a simulation: a real contact center would attach this
+   context to the transferred call itself rather than a page the rep matches by call.
+3. **Stronger identity.** The caller's number is compared to the phone on the policy; the result
+   is a flag on the rep desk and the audit row, not a gate. And a lockout across calls: five
+   failed identity attempts within 30 minutes for the same policy/claim, or from the same phone,
+   lock identity for 30 minutes. A locked caller hears "for your security, let me connect you with
+   a representative" and reaches a person; the rule is never explained to them. The caller's
+   number is stored only as a hash.
+
+**How to start, and what's new there.** The two start commands are the same as before (see "How to
+run it"). New: open the rep desk at `/rep` *before* calling; after practising failed identity, reset
+the lockout with `POST /admin/reset-lockouts`; and to see "✓ number on file" on the desk, set one
+test policy's `phone` in Supabase to the phone you call from (the seed data uses fake numbers).
+Two migrations were added (`call_events`, `auth_attempts` + `call_sessions.phone_match`), already
+applied to the Supabase project. Tests went from 111 to 135.
+
+---
+
 ## Why Mercury, and why insurance
 
 I could have picked an unregulated company. I picked insurance on purpose. It's a regulated
@@ -291,6 +333,8 @@ Honest list, so you see them here first:
 ## How to run it
 
 **Prerequisites:** Python 3.12, a Guava sandbox (API key + phone number), a Supabase project.
+(What was added after the submission, and how to use it, is summarized in "Changed since the
+submission" at the top.)
 
 ```bash
 python3.12 -m venv .venv
